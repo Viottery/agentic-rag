@@ -14,9 +14,7 @@ class AgentState(TypedDict):
     """
     Agent 运行时共享状态。
 
-    设计上为后续 ReAct 扩展预留字段：
-    - thought / next_action / action_input / observation
-    - intermediate_steps 用于记录中间轨迹
+    当前字段已经覆盖 ReAct 最小闭环，并为后续 RAG / Tool 扩展预留接口。
     """
 
     question: str
@@ -26,6 +24,9 @@ class AgentState(TypedDict):
     next_action: str
     action_input: str
     observation: str
+
+    retrieved_docs: List[str]
+    tool_result: str
 
     intermediate_steps: List[AgentStep]
 

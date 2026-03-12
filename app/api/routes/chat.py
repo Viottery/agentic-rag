@@ -18,11 +18,7 @@ def chat(req: ChatRequest) -> dict:
     """
     Chat API 入口。
 
-    当前职责仅包括：
-    - 接收用户问题
-    - 构造初始 AgentState
-    - 调用 LangGraph
-    - 返回执行结果
+    负责构造初始状态并调用 LangGraph。
     """
     initial_state: AgentState = {
         "question": req.question,
@@ -32,6 +28,9 @@ def chat(req: ChatRequest) -> dict:
         "next_action": "",
         "action_input": "",
         "observation": "",
+
+        "retrieved_docs": [],
+        "tool_result": "",
 
         "intermediate_steps": [],
 
