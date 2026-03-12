@@ -5,3 +5,4 @@ pydantic-settings
 qdrant-client
 pytest
 httpx
+langchain-openai
