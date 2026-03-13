@@ -21,19 +21,35 @@ def chat(req: ChatRequest) -> dict:
     负责构造初始状态并调用 LangGraph。
     """
     initial_state: AgentState = {
+        # user input
         "question": req.question,
         "messages": [],
 
+        # react core
         "thought": "",
         "next_action": "",
         "action_input": "",
         "observation": "",
 
+        # retrieval / tool raw outputs
         "retrieved_docs": [],
         "tool_result": "",
 
-        "intermediate_steps": [],
+        # structured evidence
+        "evidence": [],
+        "retrieved_sources": [],
+        "used_tools": [],
 
+        # trace
+        "intermediate_steps": [],
+        "trace_summary": "",
+
+        # runtime control
+        "iteration_count": 0,
+        "max_iterations": 3,
+        "error": "",
+
+        # final output
         "answer": "",
         "status": "running",
     }
