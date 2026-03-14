@@ -4,6 +4,7 @@ from app.agent.llm import get_chat_model
 from app.agent.prompt_loader import load_prompt
 from app.agent.schemas import PlannerDecision
 from app.agent.state import AgentState, AgentStep, EvidenceItem
+from app.rag.retriever import retrieve_as_context
 
 
 def planner(state: AgentState) -> AgentState:
@@ -49,45 +50,40 @@ def retrieve(state: AgentState) -> AgentState:
     """
     检索节点。
 
-    当前阶段仍使用 mock 检索结果，但会返回：
+    当前阶段接入基础版真实向量检索，返回：
     - retrieved_docs
     - evidence
     - retrieved_sources
     - observation
 
-    这样后续替换为真实 RAG 时，不需要再重构 state 流转。
+    当前仍保持单轮、基础向量搜索的朴素实现。
+    后续如果 retrieval subgraph 变复杂，这个节点可以继续保留，
+    只需把内部调用切换到更完整的 retrieval workflow。
     """
     action_input = state["action_input"].strip()
     _ = load_prompt("retrieve.md")
+    error = state["error"]
 
-    retrieved_docs = [
-        f"Mock retrieval result for query: {action_input}",
-        "Project focus: FastAPI + LangGraph + ReAct + RAG + tool calling.",
-    ]
+    try:
+        retrieval_context = retrieve_as_context(action_input)
+        retrieved_docs = retrieval_context["retrieved_docs"]
+        retrieved_sources = retrieval_context["retrieved_sources"]
+        evidence: list[EvidenceItem] = retrieval_context["evidence"]
 
-    evidence: list[EvidenceItem] = [
-        {
-            "source_type": "local_kb",
-            "source_name": "mock_kb",
-            "source_id": "mock_doc_1",
-            "title": "Mock Retrieval Document 1",
-            "content": retrieved_docs[0],
-            "score": 0.95,
-            "metadata": {"query": action_input, "rank": 1},
-        },
-        {
-            "source_type": "local_kb",
-            "source_name": "mock_kb",
-            "source_id": "mock_doc_2",
-            "title": "Mock Retrieval Document 2",
-            "content": retrieved_docs[1],
-            "score": 0.89,
-            "metadata": {"query": action_input, "rank": 2},
-        },
-    ]
-
-    retrieved_sources = [item["source_id"] for item in evidence]
-    observation = "已完成模拟检索，并生成结构化证据。"
+        if retrieved_docs:
+            observation = f"已完成知识库检索，命中 {len(retrieved_docs)} 条相关片段。"
+        else:
+            # 当前基础版检索命不中时，仍然让 agent 正常进入 responder，
+            # 由 responder 基于“无可用检索结果”生成保守回答。
+            observation = "已完成知识库检索，但未命中相关内容。"
+    except Exception as exc:
+        # 当前阶段先做节点级兜底，避免外部依赖异常直接打断整条 agent 链路。
+        # 后续如果引入更完善的错误分类/监控，可以在这里细化异常类型。
+        retrieved_docs = []
+        retrieved_sources = []
+        evidence = []
+        observation = "知识库检索执行失败，已回退为无检索结果。"
+        error = str(exc)
 
     intermediate_steps = [*state["intermediate_steps"]]
     if intermediate_steps:
@@ -101,6 +97,7 @@ def retrieve(state: AgentState) -> AgentState:
         "retrieved_sources": retrieved_sources,
         "observation": observation,
         "intermediate_steps": intermediate_steps,
+        "error": error,
     }
 
 

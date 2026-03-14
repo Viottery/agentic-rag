@@ -1,0 +1,2 @@
+RAG 模块未来会从单一 retrieve 节点升级为 retrieval subgraph。
+该子图将逐步支持 query analysis、sub-question decomposition、source routing、retrieval、reranking、evidence validation 和 evidence aggregation。

@@ -6,3 +6,4 @@ qdrant-client
 pytest
 httpx
 langchain-openai
+sentence-transformers

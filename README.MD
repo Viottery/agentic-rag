@@ -1,143 +1,149 @@
 # Agentic-RAG
 
-Agentic-RAG is a learning-oriented project focused on designing and implementing an **AI Agent system** using structured reasoning workflows and retrieval-augmented knowledge access.
+Agentic-RAG is a learning-oriented backend project for building an AI agent with structured reasoning, retrieval-augmented generation, and tool execution.
 
-The project explores how large language models can be organized into a modular agent architecture instead of being used as simple prompt-driven applications.
+The project focuses on system design rather than UI. Its goal is to explore how an LLM application can evolve from a simple prompt-based chatbot into a modular agent system with explicit workflow control.
 
----
+## Project Goal
 
-## Project Objective
+This project aims to build an Agentic RAG system based on:
 
-The goal of this project is to study how **LLM-based agents** can be designed as structured systems with explicit reasoning workflows.
+- FastAPI for API delivery
+- LangGraph for workflow orchestration
+- ReAct-style reasoning for action planning
+- Qdrant for vector retrieval
+- Docker Compose for reproducible local development
 
-Key objectives include:
-
-- Designing a **graph-based agent architecture**
-- Implementing **ReAct-style reasoning workflows**
-- Integrating **retrieval-augmented generation (RAG)**
-- Supporting **external tool invocation**
-- Building a **clean and extensible backend architecture**
-
-The focus is on **system design and engineering practices**, rather than building a simple chatbot interface.
-
----
-
-## Core Technologies
-
-The system is built using the following technologies.
-
-**Backend Framework**
-- FastAPI
-
-**Agent Framework**
-- LangGraph
-- LangChain
-
-**Retrieval Infrastructure**
-- Qdrant vector database
-
-**Containerized Environment**
-- Docker
-- Docker Compose
-
-**Language**
-- Python 3.11
-
----
-
-## Methodology
-
-The project adopts a **graph-based agent workflow** in which reasoning and actions are represented as nodes in an execution graph.
-
-Instead of a single LLM call, the agent executes a structured workflow that may include:
-
-- reasoning and planning
-- retrieval from a vector database
-- tool execution
-- response generation
-
-This design provides explicit control flow and improves the transparency and extensibility of the agent system.
-
----
-
-## System Architecture
-
-The intended architecture is organized around a central agent workflow.
-
-Client  
-│  
-▼  
-FastAPI API  
-│  
-▼  
-LangGraph Agent Workflow  
-│  
-├── Planner (ReAct reasoning)  
-│  
-├── Retrieval Node  
-│     │  
-│     ▼  
-│   Vector Database (Qdrant)  
-│  
-└── Tool Execution Node  
-│  
-▼  
-Response Generation  
-
-This workflow allows the system to perform iterative reasoning, retrieval, and action execution before generating the final response.
-
----
-
-## Project Structure
-
-agentic-rag  
-│  
-├── app  
-│   ├── api        # FastAPI endpoints  
-│   ├── agent      # agent workflow and nodes  
-│   ├── rag        # retrieval pipeline  
-│   ├── tools      # external tools  
-│   └── core       # configuration  
-│  
-├── data           # documents for retrieval  
-├── tests  
-│  
-├── Dockerfile  
-├── docker-compose.yml  
-└── requirements.txt  
-
-The structure separates **API logic**, **agent workflow**, and **capability modules** to maintain a clean architecture.
-
----
-
-## Development Approach
-
-The development process follows several stages:
-
-1. Establish containerized backend infrastructure
-2. Implement graph-based agent workflow
-3. Integrate retrieval-augmented generation
-4. Add tool execution capability
-5. Improve observability and evaluation
-
-Each stage extends the reasoning capabilities of the agent while maintaining architectural clarity.
-
----
+The long-term direction is not only to support retrieval, but to grow the retrieval layer into a richer retrieval subgraph with better decomposition, routing, reranking, validation, and evidence aggregation.
 
 ## Current Status
 
-Early-stage development.
+The project is in an early but working stage.
 
-The current version includes:
+Already implemented:
 
-- containerized development environment
 - FastAPI backend service
-- basic project structure
-- vector database service
+- LangGraph-based agent workflow
+- Planner, retrieval, tool-executor, and responder nodes
+- Basic RAG indexing pipeline
+- Qdrant-backed vector search
+- Structured evidence and trace output
+- Docker-based local development environment
 
-Agent workflow, retrieval logic, and tool execution will be implemented in later stages.
+Current limitations:
 
----
+- Retrieval is still a baseline vector-search implementation
+- Tool execution is still mocked
+- Retrieval does not yet include query rewrite, reranking, hybrid search, or evidence validation
+- There is not yet an automatic startup indexing flow
+
+## Architecture
+
+The current workflow is:
+
+Client
+  -> FastAPI
+  -> LangGraph agent
+     -> planner
+     -> retrieve or tool_executor
+     -> responder
+
+The retrieval path is:
+
+Raw text files
+  -> indexing
+  -> embeddings
+  -> Qdrant
+  -> retriever
+  -> agent retrieve node
+  -> responder
+
+## Project Structure
+
+```text
+agentic-rag/
+├── app/
+│   ├── agent/       # LangGraph workflow, nodes, prompts, state
+│   ├── api/         # FastAPI routes and schemas
+│   ├── core/        # configuration
+│   ├── rag/         # indexing, embeddings, qdrant store, retriever, cli
+│   └── tools/       # future external tools
+├── data/
+│   └── raw/         # source documents for indexing
+├── docker-compose.yml
+├── dockerfile
+├── requirements.txt
+└── README.MD
+```
+
+## How To Run
+
+Start the services:
+
+```bash
+docker compose up --build
+```
+
+Build the knowledge base index from local text files:
+
+```bash
+docker compose exec app python -m app.rag.cli index-dir data/raw
+```
+
+Check whether Qdrant has indexed points:
+
+```bash
+docker compose exec app python -m app.rag.cli check
+```
+
+Send a chat request:
+
+```bash
+curl -X POST "http://localhost:8000/chat" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "请根据知识库内容介绍一下这个项目的目标和整体架构。"
+  }'
+```
+
+## What The Chat API Returns
+
+The `/chat` endpoint currently returns the full agent state, including:
+
+- `answer`
+- `retrieved_docs`
+- `retrieved_sources`
+- `evidence`
+- `intermediate_steps`
+- `trace_summary`
+- `error`
+
+This is intentionally verbose in the current stage because the project is still focused on workflow validation and observability.
+
+## Retrieval Design Direction
+
+The current retrieval implementation is intentionally simple and maintainable:
+
+- character-based chunking
+- local embedding generation
+- vector search in Qdrant
+- evidence mapping back into agent state
+
+This baseline is meant to be replaced incrementally by a more capable retrieval subgraph that may later support:
+
+- query analysis
+- sub-question decomposition
+- source routing
+- reranking
+- evidence validation
+- evidence aggregation
+
+## Development Notes
+
+- The raw documents under `data/raw` are not automatically indexed on startup
+- If you update source files, rerun the indexing command
+- Qdrant point IDs are stored as stable UUID mappings, while business-facing `chunk_id` values are preserved in payloads
+- The code intentionally marks some baseline or naive implementations with comments so they can be upgraded later without changing the public module boundaries
 
 ## License
 

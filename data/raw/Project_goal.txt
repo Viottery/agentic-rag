@@ -1,0 +1,2 @@
+当前项目的目标是构建一个基于 FastAPI、LangGraph 和 ReAct 的 Agentic RAG 系统。
+系统需要支持 RAG 检索、工具调用、结构化推理轨迹，以及后续向企业级架构扩展。
