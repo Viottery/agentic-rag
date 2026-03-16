@@ -61,3 +61,16 @@ class QueryRewritePlan(BaseModel):
         default="",
         description="重写或拆分的简短原因说明",
     )
+
+
+class SearchResultSelection(BaseModel):
+    """搜索结果二次选择结果。"""
+
+    selected_indices: list[int] = Field(
+        default_factory=list,
+        description="从候选结果中选出的结果序号列表，使用 1-based index",
+    )
+    rationale: str = Field(
+        default="",
+        description="简短说明为什么这些结果更值得抽取",
+    )
