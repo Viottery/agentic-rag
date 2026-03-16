@@ -21,6 +21,7 @@ The current agent is no longer a single-step router. It is a serial supervisor w
 user input
   -> planner
   -> dispatcher
+  -> query_refiner
   -> rag_agent / search_agent / action_agent
   -> planner
   -> answer_generator
@@ -34,11 +35,12 @@ Current execution characteristics:
 
 - `planner` decomposes the problem into `subtasks`
 - `dispatcher` chooses the current task and routes by `task_type`
+- `query_refiner` rewrites and optionally decomposes search / retrieval queries while trying to preserve the user's language and avoid over-splitting
 - `rag_agent` is real and reads from the local knowledge base
-- `search_agent` is still mock, but returns a structured pseudo-search summary
+- `search_agent` can use Tavily when configured, otherwise falls back to mock search, and it now keeps only a small, authority-biased result set
 - `action_agent` is still mock, but returns a structured pseudo-execution result
-- `answer_generator` writes an answer draft
-- `citation_mapper` maps answer paragraphs to evidence and attaches source labels
+- `answer_generator` writes an answer draft from compacted task context
+- `citation_mapper` maps answer paragraphs to evidence and attaches source labels, preferring task-local evidence before global fallback
 - `verifier` performs lightweight citation coverage and unsupported-section checks
 - `checker` decides whether the draft can be returned
 
@@ -116,10 +118,11 @@ Current design tradeoff:
 
 ## Current Limitations
 
-- `search_agent` is still mock and does not perform real web search.
+- `search_agent` can perform real Tavily search when configured, but deeper result filtering, extraction, and validation are still basic.
 - `action_agent` is still mock and does not perform real external actions.
 - Retrieval is still baseline vector search.
 - Citation mapping and verification are currently lightweight heuristic checks, not full claim-level factual verification.
+- Query rewriting is intentionally conservative now, but it is still heuristic rather than retrieval-policy-aware.
 - `aggregated_context` and some global fields duplicate information that also exists inside `subtasks`.
 - The workflow is serial today; the dispatcher is structured for future parallel expansion, but fan-out/fan-in is not implemented yet.
 - The checker currently distinguishes quality pass vs budget-forced pass, but deeper failure taxonomy is still basic.
@@ -157,6 +160,9 @@ OPENAI_API_KEY=...
 OPENAI_BASE_URL=...
 OPENAI_MODEL=...
 OPENAI_TEMPERATURE=0
+TAVILY_API_KEY=
+TAVILY_SEARCH_DEPTH=basic
+TAVILY_MAX_RESULTS=5
 
 AGENT_MAX_ITERATIONS=6
 AGENT_MAX_DURATION_SECONDS=90

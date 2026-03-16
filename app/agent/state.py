@@ -49,6 +49,9 @@ class SubTask(TypedDict, total=False):
     error: str
     degraded: bool
     degraded_reason: str
+    rewritten_query: str
+    sub_queries: List[str]
+    rewrite_reason: str
 
 
 class PlannerControl(TypedDict, total=False):

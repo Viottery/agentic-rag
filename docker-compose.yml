@@ -24,6 +24,9 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL}
       OPENAI_MODEL: ${OPENAI_MODEL}
       OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      TAVILY_API_KEY: ${TAVILY_API_KEY}
+      TAVILY_SEARCH_DEPTH: ${TAVILY_SEARCH_DEPTH}
+      TAVILY_MAX_RESULTS: ${TAVILY_MAX_RESULTS}
       HF_ENDPOINT: https://hf-mirror.com
       HF_HOME: /root/.cache/huggingface
       TRANSFORMERS_CACHE: /root/.cache/huggingface/hub

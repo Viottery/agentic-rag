@@ -3,14 +3,17 @@ from __future__ import annotations
 from datetime import datetime
 import re
 import time
+from collections import OrderedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agent.llm import get_chat_model
 from app.agent.prompt_loader import load_prompt
-from app.agent.schemas import CheckerDecision, PlannerDecision
+from app.agent.schemas import CheckerDecision, PlannerDecision, QueryRewritePlan
 from app.agent.state import AgentState, AgentStep, CitationItem, EvidenceItem, SubTask
+from app.core.config import get_settings
 from app.rag.retriever import retrieve_as_context
+from app.tools.tavily_search import tavily_search
 
 
 def _format_subtasks(subtasks: list[SubTask]) -> str:
@@ -28,7 +31,7 @@ def _format_subtasks(subtasks: list[SubTask]) -> str:
                 f"type={task.get('task_type', '')} "
                 f"status={task.get('status', '')} "
                 f"question={task.get('question', '')} "
-                f"result={task.get('result', '')}"
+                f"result={_compact_task_result(task)}"
                 f"{degraded_text}"
             )
         )
@@ -59,6 +62,9 @@ def _merge_subtasks(existing: list[SubTask], proposed: list[dict]) -> list[SubTa
                 "error": prior.get("error", ""),
                 "degraded": prior.get("degraded", False),
                 "degraded_reason": prior.get("degraded_reason", ""),
+                "rewritten_query": prior.get("rewritten_query", ""),
+                "sub_queries": prior.get("sub_queries", []),
+                "rewrite_reason": prior.get("rewrite_reason", ""),
             }
         )
 
@@ -124,10 +130,124 @@ def _build_aggregated_context(subtasks: list[SubTask]) -> str:
     return "\n\n".join(
         (
             f"[{task.get('task_type', 'unknown')}] {task.get('question', '')}\n"
-            f"{task.get('result', '')}"
+            f"{_compact_task_result(task)}"
         )
         for task in completed
     )
+
+
+def _task_queries(task: SubTask) -> list[str]:
+    queries: list[str] = []
+    rewritten = task.get("rewritten_query", "").strip()
+    if rewritten:
+        queries.append(rewritten)
+
+    for item in task.get("sub_queries", []):
+        cleaned = item.strip()
+        if cleaned and cleaned not in queries:
+            queries.append(cleaned)
+
+    if not queries and task.get("question", "").strip():
+        queries.append(task["question"].strip())
+
+    return queries[:3]
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
+
+
+def _normalize_query_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip().rstrip("?.。！？")
+
+
+def _should_decompose_query(task_question: str) -> bool:
+    lowered = task_question.lower()
+    signals = ["以及", "并且", "和", "与", "及", "and", "or", ",", "，", "、", "vs"]
+    has_signal = any(signal in lowered for signal in signals)
+    return has_signal and len(_tokenize_for_match(task_question)) >= 12
+
+
+def _truncate_text(text: str, limit: int = 280) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 1].rstrip() + "…"
+
+
+def _compact_task_result(task: SubTask) -> str:
+    evidence = task.get("evidence", [])
+    if evidence:
+        snippets = []
+        for item in evidence[:2]:
+            title = item.get("title", "unknown")
+            content = _truncate_text(item.get("content", ""), 140)
+            snippets.append(f"- {title}: {content}")
+        return "\n".join(snippets)
+
+    return _truncate_text(task.get("result", ""), 220)
+
+
+def _format_evidence_for_prompt(evidence_items: list[EvidenceItem], limit: int = 4) -> str:
+    if not evidence_items:
+        return "None"
+
+    rendered = []
+    seen: set[str] = set()
+    for item in evidence_items:
+        label = _citation_label(item)
+        if label in seen:
+            continue
+        seen.add(label)
+        rendered.append(
+            f"- [{item.get('source_type', 'unknown')}] "
+            f"{item.get('source_name', 'unknown')} / {label}: "
+            f"{_truncate_text(item.get('content', ''), 160)}"
+        )
+        if len(rendered) >= limit:
+            break
+
+    return "\n".join(rendered) if rendered else "None"
+
+
+def _domain_from_url(url: str) -> str:
+    match = re.search(r"https?://([^/]+)", url)
+    return match.group(1).lower() if match else ""
+
+
+def _query_focus_terms(query: str) -> list[str]:
+    terms = []
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}", query):
+        lowered = token.lower()
+        if lowered not in {"what", "current", "features", "capabilities", "limitations", "restrictions"}:
+            terms.append(lowered)
+    return terms[:3]
+
+
+def _search_result_rank(item: dict, query: str) -> tuple[float, str]:
+    url = str(item.get("url", "")).strip()
+    title = str(item.get("title", "")).lower()
+    content = str(item.get("content", "")).lower()
+    domain = _domain_from_url(url)
+    focus_terms = _query_focus_terms(query)
+
+    score = 0.0
+    if "docs." in domain:
+        score += 3.0
+    if any(term in domain for term in focus_terms):
+        score += 2.5
+    if any(term in title for term in focus_terms):
+        score += 1.5
+    if any(term in content for term in focus_terms):
+        score += 0.5
+    if domain.endswith(".com"):
+        score += 0.2
+
+    low_trust_domains = ["lobehub.com", "aiagentsdirectory.com", "docs.sim.ai"]
+    if any(domain.endswith(item_domain) for item_domain in low_trust_domains):
+        score -= 2.0
+
+    return (score, url)
 
 
 def _extract_quoted_text(text: str) -> str:
@@ -339,17 +459,104 @@ def dispatcher(state: AgentState) -> AgentState:
     }
 
 
+def query_refiner(state: AgentState) -> AgentState:
+    """为 rag/search 子任务重写并拆分查询。"""
+    task = state["current_task"]
+    task_type = task.get("task_type", "").strip() or "rag"
+    task_question = task.get("question", "").strip()
+
+    prompt_template = load_prompt("query_refiner.md")
+    llm = get_chat_model().with_structured_output(QueryRewritePlan)
+    messages = [
+        SystemMessage(content=prompt_template),
+        HumanMessage(
+            content=(
+                f"任务类型：{task_type}\n"
+                f"任务问题：{task_question}\n\n"
+                "请输出适合当前任务的主查询 rewritten_query，"
+                "并在必要时给出 0-3 个 sub_queries。"
+            )
+        ),
+    ]
+
+    plan = llm.invoke(messages)
+    task_is_cjk = _contains_cjk(task_question)
+
+    rewritten_query = _normalize_query_text(plan.rewritten_query.strip() or task_question)
+    if task_is_cjk and not _contains_cjk(rewritten_query):
+        rewritten_query = _normalize_query_text(task_question)
+
+    allow_decomposition = _should_decompose_query(task_question)
+    sub_queries: list[str] = []
+    if allow_decomposition:
+        for item in plan.sub_queries:
+            cleaned = _normalize_query_text(item)
+            if not cleaned:
+                continue
+            if task_is_cjk and not _contains_cjk(cleaned):
+                continue
+            if cleaned == rewritten_query or cleaned in sub_queries:
+                continue
+            sub_queries.append(cleaned)
+
+    updated_task: SubTask = {
+        **task,
+        "rewritten_query": rewritten_query,
+        "sub_queries": sub_queries[:2],
+        "rewrite_reason": plan.rewrite_reason.strip(),
+    }
+    subtasks = _replace_task(state, updated_task)
+
+    observation = (
+        f"已完成查询重写。主查询：{updated_task.get('rewritten_query', '')}；"
+        f"子查询数：{len(updated_task.get('sub_queries', []))}。"
+    )
+
+    return {
+        **state,
+        "subtasks": subtasks,
+        "current_task": updated_task,
+        "observation": observation,
+        "intermediate_steps": _append_step(
+            state,
+            "query_refiner",
+            task_question,
+            observation,
+        ),
+    }
+
+
 def rag_agent(state: AgentState) -> AgentState:
     """本地知识库检索 agent。"""
     task = state["current_task"]
-    query = task.get("question", "").strip()
+    queries = _task_queries(task)
     try:
-        retrieval_context = retrieve_as_context(query)
-        retrieved_docs = retrieval_context["retrieved_docs"]
-        retrieved_sources = retrieval_context["retrieved_sources"]
-        evidence: list[EvidenceItem] = retrieval_context["evidence"]
+        merged_docs: list[str] = []
+        merged_sources: list[str] = []
+        merged_evidence: list[EvidenceItem] = []
+        seen_sources: set[str] = set()
+
+        for query in queries:
+            retrieval_context = retrieve_as_context(query)
+            for doc in retrieval_context["retrieved_docs"]:
+                if doc not in merged_docs:
+                    merged_docs.append(doc)
+            for source in retrieval_context["retrieved_sources"]:
+                if source not in seen_sources:
+                    seen_sources.add(source)
+                    merged_sources.append(source)
+            for item in retrieval_context["evidence"]:
+                source_id = item.get("source_id", "")
+                if source_id and source_id in seen_sources:
+                    pass
+                if not any(existing.get("source_id", "") == source_id for existing in merged_evidence):
+                    merged_evidence.append(item)
+
+        retrieved_docs = merged_docs[:4]
+        retrieved_sources = merged_sources[:4]
+        evidence = merged_evidence[:4]
         result = "\n".join(retrieved_docs) if retrieved_docs else "未命中相关知识库内容。"
-        observation = f"RAG 子任务完成，命中 {len(retrieved_docs)} 条片段。"
+        observation = f"RAG 子任务完成，执行 {len(queries)} 个查询，命中 {len(retrieved_docs)} 条片段。"
         task_error = ""
         status = "done"
     except Exception as exc:
@@ -381,44 +588,105 @@ def rag_agent(state: AgentState) -> AgentState:
         "aggregated_context": _build_aggregated_context(subtasks),
         "observation": observation,
         "error": task_error,
-        "intermediate_steps": _append_step(state, "rag_agent", query, observation),
+        "intermediate_steps": _append_step(state, "rag_agent", " | ".join(queries), observation),
     }
 
 
 def search_agent(state: AgentState) -> AgentState:
-    """信息获取类 agent，当前为 mock 搜索。"""
+    """信息获取类 agent，优先走 Tavily，缺失配置时回退到 mock。"""
     task = state["current_task"]
-    query = task.get("question", "").strip()
+    queries = _task_queries(task)
+    settings = get_settings()
 
-    tool_name = "mock_search"
-    result = (
-        f"Search findings for query: {query}\n"
-        "1. OpenAI 近期主要产品线集中在通用对话模型、推理模型和轻量化模型。\n"
-        "2. 代表性方向包括：高质量通用模型、强调多模态能力的模型，以及强调推理效率的小型模型。\n"
-        "3. 对外描述通常会围绕响应质量、工具使用能力和成本效率展开。\n"
-        "4. 当前结果为搜索代理的模拟回传，用于验证多 agent 编排与总结链路。"
-    )
-    observation = "搜索子任务已通过 mock 搜索执行完成，并返回结构化摘要。"
+    tool_name = "tavily_search" if settings.tavily_api_key.strip() else "mock_search"
+    degraded = not settings.tavily_api_key.strip()
+    evidence_items: list[EvidenceItem] = []
 
-    evidence: EvidenceItem = {
-        "source_type": "tool",
-        "source_name": tool_name,
-        "source_id": f"{task.get('task_id', 'search')}_result",
-        "title": "Mock Search Result",
-        "content": result,
-        "score": 1.0,
-        "metadata": {"query": query, "degraded": True},
-    }
+    if degraded:
+        result = (
+            f"Search findings for query: {queries[0]}\n"
+            "1. OpenAI 近期主要产品线集中在通用对话模型、推理模型和轻量化模型。\n"
+            "2. 代表性方向包括：高质量通用模型、强调多模态能力的模型，以及强调推理效率的小型模型。\n"
+            "3. 对外描述通常会围绕响应质量、工具使用能力和成本效率展开。\n"
+            "4. 当前结果为搜索代理的模拟回传，用于验证多 agent 编排与总结链路。"
+        )
+        observation = "搜索子任务已通过 mock 搜索执行完成，并返回结构化摘要。"
+        evidence_items.append(
+            {
+                "source_type": "tool",
+                "source_name": tool_name,
+                "source_id": f"{task.get('task_id', 'search')}_result",
+                "title": "Mock Search Result",
+                "content": result,
+                "score": 1.0,
+                "metadata": {"query": queries[0], "degraded": True},
+            }
+        )
+    else:
+        rendered_parts: list[str] = []
+        seen_urls: OrderedDict[str, None] = OrderedDict()
+        result_limit = min(max(settings.tavily_max_results, 1), 3)
+        counter = 1
+        for query in queries:
+            payload = tavily_search(
+                query,
+                api_key=settings.tavily_api_key,
+                search_depth=settings.tavily_search_depth,
+                max_results=settings.tavily_max_results,
+            )
+            results = sorted(
+                payload.get("results", []),
+                key=lambda item: _search_result_rank(item, query),
+                reverse=True,
+            )
+            rendered_parts.append(f"Search results for query: {query}")
+            for item in results:
+                url = str(item.get("url", "")).strip()
+                if url and url in seen_urls:
+                    continue
+                if url:
+                    seen_urls[url] = None
+
+                title = str(item.get("title", "")).strip() or f"Result {counter}"
+                content = _truncate_text(str(item.get("content", "")).strip(), 220)
+                rendered_parts.append(f"{counter}. {title} - {content}")
+                evidence_items.append(
+                    {
+                        "source_type": "tool",
+                        "source_name": tool_name,
+                        "source_id": f"{task.get('task_id', 'search')}_result_{counter}",
+                        "title": title,
+                        "content": content,
+                        "score": 1.0,
+                        "metadata": {
+                            "query": query,
+                            "url": url,
+                            "degraded": False,
+                        },
+                    }
+                )
+                counter += 1
+                if counter > result_limit:
+                    break
+            if counter > result_limit:
+                break
+
+        result = "\n".join(rendered_parts) if rendered_parts else f"No Tavily results for query: {queries[0]}"
+        observation = f"搜索子任务已通过 Tavily 执行完成，查询数 {len(queries)}，结果数 {len(evidence_items)}。"
 
     updated_task: SubTask = {
         **task,
         "status": "done",
         "result": result,
-        "evidence": [evidence],
+        "evidence": evidence_items,
         "sources": [tool_name],
         "error": "",
-        "degraded": True,
-        "degraded_reason": "search_agent 当前为 mock，实现用于验证编排链路而非真实联网搜索。",
+        "degraded": degraded,
+        "degraded_reason": (
+            "search_agent 当前为 mock，实现用于验证编排链路而非真实联网搜索。"
+            if degraded
+            else ""
+        ),
     }
     subtasks = _replace_task(state, updated_task)
 
@@ -427,10 +695,10 @@ def search_agent(state: AgentState) -> AgentState:
         "subtasks": subtasks,
         "current_task": updated_task,
         "used_tools": [*state["used_tools"], tool_name],
-        "evidence": [*state["evidence"], evidence],
+        "evidence": [*state["evidence"], *evidence_items],
         "aggregated_context": _build_aggregated_context(subtasks),
         "observation": observation,
-        "intermediate_steps": _append_step(state, "search_agent", query, observation),
+        "intermediate_steps": _append_step(state, "search_agent", " | ".join(queries), observation),
     }
 
 
@@ -484,15 +752,7 @@ def answer_generator(state: AgentState) -> AgentState:
     llm = get_chat_model()
 
     subtasks_text = _format_subtasks(state["subtasks"])
-    evidence_text = (
-        "\n".join(
-            f"- [{item.get('source_type', 'unknown')}] "
-            f"{item.get('source_name', 'unknown')}: {item.get('content', '')}"
-            for item in state["evidence"]
-        )
-        if state["evidence"]
-        else "None"
-    )
+    evidence_text = _format_evidence_for_prompt(state["evidence"])
 
     messages = [
         SystemMessage(content=prompt_template),
@@ -545,6 +805,7 @@ def citation_mapper(state: AgentState) -> AgentState:
     paragraphs = _split_paragraphs(state["answer_draft"])
     evidence_items = state["evidence"]
     force_reason = state["planner_control"].get("force_answer_reason", "").strip()
+    completed_subtasks = [task for task in state["subtasks"] if task.get("status") == "done"]
 
     grounded_parts: list[str] = []
     citations: list[CitationItem] = []
@@ -554,13 +815,18 @@ def citation_mapper(state: AgentState) -> AgentState:
             grounded_parts.append(paragraph)
             continue
 
+        scoped_evidence = []
+        if paragraph_index < len(completed_subtasks):
+            scoped_evidence = completed_subtasks[paragraph_index].get("evidence", [])
+
+        candidate_evidence = scoped_evidence or evidence_items
         scored = sorted(
             (
                 (
                     _support_score(paragraph, evidence),
                     evidence,
                 )
-                for evidence in evidence_items
+                for evidence in candidate_evidence
             ),
             key=lambda item: item[0],
             reverse=True,
@@ -572,8 +838,28 @@ def citation_mapper(state: AgentState) -> AgentState:
             if score > 0
         ]
 
+        if not matched and candidate_evidence is not evidence_items:
+            scored = sorted(
+                (
+                    (
+                        _support_score(paragraph, evidence),
+                        evidence,
+                    )
+                    for evidence in evidence_items
+                ),
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            matched = [
+                (score, evidence)
+                for score, evidence in scored[:2]
+                if score > 0
+            ]
+
         # Single-evidence answers are often short paraphrases; keep one fallback citation.
-        if not matched and len(evidence_items) == 1:
+        if not matched and len(candidate_evidence) == 1:
+            matched = [(0.01, candidate_evidence[0])]
+        elif not matched and len(evidence_items) == 1:
             matched = [(0.01, evidence_items[0])]
 
         if not matched:
@@ -581,8 +867,12 @@ def citation_mapper(state: AgentState) -> AgentState:
             continue
 
         labels: list[str] = []
+        seen_labels: set[str] = set()
         for score, evidence in matched:
             label = _citation_label(evidence)
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
             labels.append(label)
             citations.append(
                 {

@@ -44,3 +44,20 @@ class CheckerDecision(BaseModel):
         ...,
         description="若未通过，说明缺失信息、逻辑问题或建议补充的任务方向",
     )
+
+
+class QueryRewritePlan(BaseModel):
+    """query 重写与拆分结果。"""
+
+    rewritten_query: str = Field(
+        ...,
+        description="更适合检索或搜索的主查询",
+    )
+    sub_queries: list[str] = Field(
+        default_factory=list,
+        description="若问题较复杂，可拆出的 0-3 个子查询",
+    )
+    rewrite_reason: str = Field(
+        default="",
+        description="重写或拆分的简短原因说明",
+    )

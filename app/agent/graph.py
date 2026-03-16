@@ -7,6 +7,7 @@ from app.agent.nodes import (
     citation_mapper,
     dispatcher,
     planner,
+    query_refiner,
     rag_agent,
     search_agent,
     verifier,
@@ -28,11 +29,21 @@ def route_after_dispatcher(state: AgentState) -> str:
     task_type = state["current_task"].get("task_type", "")
 
     if task_type == "rag":
+        return "query_refiner"
+    if task_type == "search":
+        return "query_refiner"
+    if task_type == "action":
+        return "action_agent"
+    return "planner"
+
+
+def route_after_query_refiner(state: AgentState) -> str:
+    task_type = state["current_task"].get("task_type", "")
+
+    if task_type == "rag":
         return "rag_agent"
     if task_type == "search":
         return "search_agent"
-    if task_type == "action":
-        return "action_agent"
     return "planner"
 
 
@@ -48,8 +59,8 @@ def build_graph():
 
     当前链路：
         planner
-          ├─ dispatcher -> rag_agent    -> planner
-          ├─ dispatcher -> search_agent -> planner
+          ├─ dispatcher -> query_refiner -> rag_agent    -> planner
+          ├─ dispatcher -> query_refiner -> search_agent -> planner
           ├─ dispatcher -> action_agent -> planner
           ├─ answer_generator -> citation_mapper -> verifier -> checker -> END
           └─ answer_generator -> citation_mapper -> verifier -> checker -> planner
@@ -58,6 +69,7 @@ def build_graph():
 
     graph.add_node("planner", planner)
     graph.add_node("dispatcher", dispatcher)
+    graph.add_node("query_refiner", query_refiner)
     graph.add_node("rag_agent", rag_agent)
     graph.add_node("search_agent", search_agent)
     graph.add_node("action_agent", action_agent)
@@ -82,9 +94,18 @@ def build_graph():
         "dispatcher",
         route_after_dispatcher,
         {
+            "query_refiner": "query_refiner",
+            "action_agent": "action_agent",
+            "planner": "planner",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "query_refiner",
+        route_after_query_refiner,
+        {
             "rag_agent": "rag_agent",
             "search_agent": "search_agent",
-            "action_agent": "action_agent",
             "planner": "planner",
         },
     )

@@ -28,20 +28,22 @@ flowchart TD
     B -->|finish| Z[END]
 
     C --> D{current_task.task_type}
-    D -->|rag| E[rag_agent]
-    D -->|search| F[search_agent]
+    D -->|rag/search| QR[query_refiner]
     D -->|action| H[action_agent]
+    QR --> E{task_type}
+    E -->|rag| F[rag_agent]
+    E -->|search| I[search_agent]
 
-    E --> A
     F --> A
+    I --> A
     H --> A
 
-    G --> I[citation_mapper]
-    I --> J[verifier]
-    J --> K[checker]
-    K -->|quality pass| L[END]
-    K -->|quality fail| A
-    K -->|forced budget pass| L
+    G --> J[citation_mapper]
+    J --> K[verifier]
+    K --> L[checker]
+    L -->|quality pass| M[END]
+    L -->|quality fail| A
+    L -->|forced budget pass| M
 ```
 
 这条链路表达的是：
@@ -50,6 +52,7 @@ flowchart TD
 用户问题
   -> planner 拆解/选择子任务
   -> dispatcher 分发
+  -> query_refiner 做 query 重写和拆分
   -> 子 agent 执行
   -> 回到 planner 复盘
   -> answer_generator 生成答案草稿
@@ -93,6 +96,21 @@ flowchart TD
 
 当前是串行分发，但接口已经是 task-based，后续可以演进到并行 fan-out。
 
+### query_refiner
+
+职责：
+
+- 对 `rag` / `search` 子任务做 query 重写
+- 对复杂问题生成少量 `sub_queries`
+- 为下游检索与搜索提供更直观、可执行的查询
+
+当前实现特点：
+
+- 使用单次结构化 LLM 输出
+- 优先保持用户原始语种，避免无意义的英文化重写
+- 对简单问题尽量不拆，对复杂问题也只保留少量非重叠 `sub_queries`
+- 不区分“本地检索”和“在线搜索”的高层策略，只统一做信息型任务的 query 优化
+
 ### rag_agent
 
 职责：
@@ -118,13 +136,15 @@ flowchart TD
 职责：
 
 - 处理信息获取类任务
-- 当前仍为 mock
-- 写回“看似合理”的搜索摘要，供 planner / answer_generator / checker 验证编排链路
+- 优先尝试使用 Tavily 执行真实搜索
+- 若未配置 `TAVILY_API_KEY`，回退到 mock 搜索
+- 写回统一 evidence 结构
 
 当前问题：
 
-- 它不是实时联网搜索
-- 因此结果带有 `degraded=True` 与 `degraded_reason`
+- 缺少 API key 时仍然是 mock
+- 目前搜索后还没有网页级抽取和二次验证
+- 当前只是做了轻量 authority ranking，离稳定的官方源优先策略还有距离
 
 ### action_agent
 
@@ -160,6 +180,8 @@ flowchart TD
 
 - 使用轻量规则做段落级引用映射
 - 不额外调用 LLM
+- 优先在对应子任务的 evidence 中找引用，再回退到全局 evidence
+- 会对同段重复引用做去重
 - 优先控制 token 消耗与响应速度
 
 ### verifier
@@ -225,6 +247,12 @@ flowchart TD
 - `answer`
 - `status`
 
+当前上下文压缩策略：
+
+- `aggregated_context` 优先保留每个已完成子任务的紧凑摘要，而不是原始长结果
+- 传给 `answer_generator` 的 evidence 会截断并去重，避免把整份搜索结果原样塞回模型
+- 真实搜索结果会做轻量排序与截断，优先保留更可信、更贴题的少量结果
+
 `SubTask` 重点字段：
 
 - `task_id`
@@ -237,6 +265,9 @@ flowchart TD
 - `error`
 - `degraded`
 - `degraded_reason`
+- `rewritten_query`
+- `sub_queries`
+- `rewrite_reason`
 
 `PlannerControl` 重点字段：
 
@@ -334,6 +365,7 @@ flowchart TD
 ### 当前问题
 
 - `search_agent` 不是真实外网搜索
+- `query_refiner` 目前只做轻量 query 重写与拆分，还没有更复杂的 retrieval/search routing
 - `action_agent` 不是真实执行器
 - `citation_mapper` 目前是段落级引用映射，不是句级引用
 - `verifier` 目前是轻量启发式检查，不是完整事实核验器

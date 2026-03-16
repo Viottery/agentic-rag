@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     qdrant_port: int = 6333
     agent_max_iterations: int = 6
     agent_max_duration_seconds: int = 90
+    tavily_api_key: str = ""
+    tavily_search_depth: str = "basic"
+    tavily_max_results: int = 5
 
     model_config = SettingsConfigDict(
         env_file=".env",
