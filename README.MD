@@ -15,8 +15,9 @@ The next practical goal is not to hardcode more and more fixed workflows, but to
 
 In the near term, this means:
 
-- making local RAG hierarchical and route-aware
-- treating online search as a fallback or explicit search path
+- making local RAG hierarchical, route-aware, and eventually multi-recall + rerank
+- treating online search as a fallback or explicit search path with a more mature retrieval pipeline
+- using LangGraph fan-out / fan-in to parallelize complex retrieval and search tasks
 - keeping grounded answers, citations, and verification as hard constraints
 
 In the longer term, this means evolving the system from an "agentic RAG demo" into a more complete agent runtime that can search, read and edit files, run code, call tools, build knowledge bases, and iteratively solve complex tasks.
@@ -144,11 +145,11 @@ Current repository conventions for this phase are:
 
 - `search_agent` can perform real Tavily search when configured, but deeper result filtering, extraction, and validation are still basic.
 - `action_agent` is still mock and does not perform real external actions.
-- Local retrieval is still baseline vector search rather than hierarchical routing over structured knowledge domains.
+- Local retrieval is still baseline vector search rather than hierarchical routing with multi-recall and reranking over structured knowledge domains.
 - Citation mapping and verification are currently lightweight heuristic checks, not full claim-level factual verification.
 - Query rewriting is intentionally conservative now, but it is still heuristic rather than retrieval-policy-aware.
 - `aggregated_context` and some global fields duplicate information that also exists inside `subtasks`.
-- The workflow is serial today; the dispatcher is structured for future parallel expansion, but fan-out/fan-in is not implemented yet.
+- The workflow is serial today; the dispatcher is structured for future parallel expansion, but retrieval/search-level fan-out/fan-in is not implemented yet.
 - The checker currently distinguishes quality pass vs budget-forced pass, but deeper failure taxonomy is still basic.
 - Tool use is still at an early stage; the current graph has an execution boundary, but not yet a general-purpose agent runtime comparable to coding agents or desktop agent assistants.
 

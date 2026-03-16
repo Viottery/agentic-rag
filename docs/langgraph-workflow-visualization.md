@@ -80,6 +80,7 @@ flowchart TD
 - 明确要求联网或本地检索不足时，转入 online search path
 - 复杂工具执行类问题走 tool/runtime path
 - 只有知识库构建、索引维护这类任务，才额外进入独立子流程
+- 复杂 retrieval/search 问题逐步引入 LangGraph 支持的并行 fan-out / fan-in
 
 ## 3. Graph 的定位
 
@@ -91,6 +92,7 @@ flowchart TD
 2. 约束高成本节点的调用顺序和预算
 3. 统一 state / evidence / citation 的流转方式
 4. 为后续更复杂的 retrieval routing 和 tool runtime 留出扩展接口
+5. 为 future fan-out / fan-in 并行分支保留清晰的汇合点
 
 这意味着：
 
@@ -134,7 +136,7 @@ flowchart TD
 - 将任务状态标记为 `running`
 - 根据 `task_type` 路由到具体子 agent
 
-当前是串行分发，但接口已经是 task-based，后续可以演进到并行 fan-out。
+当前是串行分发，但接口已经是 task-based，后续可以演进到并行 fan-out / fan-in。
 
 它的定位更偏“任务路由器”，而不是最终的复杂 workflow 引擎。
 
@@ -156,6 +158,7 @@ flowchart TD
 后续演化方向：
 
 - 对本地 RAG，配合层次化知识库元数据做粗到细的范围收缩
+- 对本地 RAG，逐步支持多路召回与重排序，而不只是单次向量检索
 - 对在线搜索，更多承担实体约束、问题压缩和搜索意图表达
 - 对简单问题保持克制，减少无意义 rewrite
 
@@ -187,6 +190,18 @@ flowchart TD
   - Qdrant 中的层次化组织
   - 每层知识域的元数据描述
   - 逐层缩小范围后再进入细粒度 chunk 检索
+  - 在选定范围内支持多路召回与重排序
+
+更成熟的目标 pipeline 应更接近：
+
+```text
+route to scope
+  -> multi-recall
+  -> candidate fusion
+  -> rerank
+  -> chunk selection
+  -> evidence
+```
 
 ### search_agent
 
@@ -202,14 +217,32 @@ flowchart TD
 当前问题：
 
 - 缺少 API key 时仍然是 mock
-- 当前网页抽取与 chunk rerank 仍是轻量启发式，不是完整网页检索子图
-- 当前只是做了轻量 authority ranking，离稳定的官方源优先策略还有距离
+- 当前网页抽取与 chunk rerank 仍偏轻量，不是更成熟的标准化 search pipeline
+- 当前结果清洗与来源筛选仍有启发式成分
 
 后续定位：
 
 - 作为本地 RAG 不足时的补充型 retrieval
 - 或作为用户显式要求联网搜索时的主路径
 - 不追求对所有问题都默认联网
+
+更成熟的目标 pipeline 应更接近：
+
+```text
+query planning
+  -> search
+  -> result normalization
+  -> dedup
+  -> extract
+  -> chunk
+  -> rerank
+  -> evidence selection
+```
+
+设计原则：
+
+- 尽量少依赖不断堆叠的人工启发式
+- 优先把质量提升放在 pipeline 设计、排序质量、去重和结构化 evidence 上
 
 ### action_agent
 
@@ -278,7 +311,7 @@ flowchart TD
 
 当前实现特点：
 
-- 是轻量启发式校验，不是完整 claim-level fact checking
+- 是轻量校验，不是完整 claim-level fact checking
 - 目标是先快速过滤掉明显不可信的回答
 
 它当前承担的是“可信底线”，不是最终的完整事实审查器。
@@ -457,16 +490,16 @@ flowchart TD
 
 ### 当前问题
 
-- `search_agent` 已接入真实搜索，但结果选择、网页抽取、chunk 过滤与引用匹配仍是启发式实现
+- `search_agent` 已接入真实搜索，但结果标准化、抽取、chunk 化、重排与证据选择仍是第一版实现
 - `query_refiner` 目前只做轻量 query 重写与拆分，还没有更复杂的 local routing / online search policy
 - `action_agent` 不是真实执行器
 - `citation_mapper` 目前是段落级引用映射，不是句级引用
-- `verifier` 目前是轻量启发式检查，不是完整事实核验器
+- `verifier` 目前是轻量检查，不是完整事实核验器
 - `aggregated_context`、全局 `evidence` 与 `subtasks[*].result/evidence` 之间仍有信息重复
 - 预算限制目前是全局的，缺少更细的节点级超时治理
 - `checker` 的失败类型还不够细
-- 并行调度接口已预留，但尚未实现
-- 本地 RAG 还没有层次化知识域、路由元数据和逐层缩小范围的 retrieval subgraph
+- 并行调度接口已预留，但尚未实现 retrieval/search 级 fan-out / fan-in
+- 本地 RAG 还没有层次化知识域、路由元数据、多路召回和逐层缩小范围的 retrieval subgraph
 - 简单任务还没有稳定 fast path，复杂任务也还没有独立 tool runtime
 
 ### 为什么这样做仍然合理
@@ -517,9 +550,12 @@ flowchart TD
 - 把知识库构建、索引刷新这类高副作用流程单独工程化
 - 把一般复杂问题的执行路径交给 agent 规划，而不是预先写死所有专用 workflow
 - 让 retrieval、tool use、citation、verification 使用尽量统一的数据契约
+- 尽量减少把系统主干建立在手工启发式上的做法
+- 优先用成熟 pipeline、多路召回、重排序和 fan-out / fan-in 图结构解决复杂问题
 
 ## 11. 下一步建议
 
-- 先把本地 RAG 做成更结构化的层次化检索系统
-- 再把在线搜索收敛为补充型 retrieval，并为简单问题提供更短路径
+- 先把本地 RAG 做成更结构化、支持多路召回与重排序的层次化检索系统
+- 再把在线搜索收敛为补充型 retrieval，并向更成熟的 search pipeline 演化
+- 同时逐步把复杂 retrieval/search 任务升级为支持并行 fan-out / fan-in 的图结构
 - 之后再把 `action_agent` 演化为更完整的 tool runtime 与复杂任务执行边界
