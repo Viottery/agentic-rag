@@ -10,6 +10,7 @@ Evaluate whether the answer draft is ready to return to the user.
 
 - The draft answers the user's actual question.
 - The draft is supported by the available subtask results and context.
+- The grounded answer should preserve the meaning of the draft while keeping citations and verification constraints intact.
 - The draft does not ignore important missing information.
 - The draft does not make unsupported claims.
 - If the available tool result is explicitly marked as mock or simulated, a draft that clearly states this limitation can still pass.

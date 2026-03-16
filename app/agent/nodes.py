@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+import re
 import time
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -7,7 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agent.llm import get_chat_model
 from app.agent.prompt_loader import load_prompt
 from app.agent.schemas import CheckerDecision, PlannerDecision
-from app.agent.state import AgentState, AgentStep, EvidenceItem, SubTask
+from app.agent.state import AgentState, AgentStep, CitationItem, EvidenceItem, SubTask
 from app.rag.retriever import retrieve_as_context
 
 
@@ -17,6 +19,9 @@ def _format_subtasks(subtasks: list[SubTask]) -> str:
 
     lines = []
     for task in subtasks:
+        degraded_text = ""
+        if task.get("degraded", False):
+            degraded_text = f" degraded=true degraded_reason={task.get('degraded_reason', '')}"
         lines.append(
             (
                 f"- id={task.get('task_id', '')} "
@@ -24,6 +29,7 @@ def _format_subtasks(subtasks: list[SubTask]) -> str:
                 f"status={task.get('status', '')} "
                 f"question={task.get('question', '')} "
                 f"result={task.get('result', '')}"
+                f"{degraded_text}"
             )
         )
     return "\n".join(lines)
@@ -124,6 +130,93 @@ def _build_aggregated_context(subtasks: list[SubTask]) -> str:
     )
 
 
+def _extract_quoted_text(text: str) -> str:
+    match = re.search(r"['\"]([^'\"]+)['\"]", text)
+    if match:
+        return match.group(1)
+
+    cn_match = re.search(r"[“‘]([^”’]+)[”’]", text)
+    if cn_match:
+        return cn_match.group(1)
+
+    return ""
+
+
+def _maybe_mock_action_result(action_input: str) -> str:
+    quoted = _extract_quoted_text(action_input)
+
+    if quoted and ("大写" in action_input or "uppercase" in action_input.lower()):
+        transformed = quoted.upper()
+        return (
+            f"Mock action execution result:\n"
+            f"- operation: uppercase\n"
+            f"- input: {quoted}\n"
+            f"- output: {transformed}\n"
+            "当前结果由 mock action_agent 生成，用于验证 agent 编排与可信检查链路。"
+        )
+
+    return (
+        f"Mock action executed successfully for task: {action_input}\n"
+        "当前结果由 mock action_agent 生成，用于验证 agent 编排与可信检查链路。"
+    )
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+
+
+def _tokenize_for_match(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", text.lower())
+
+
+def _support_score(paragraph: str, evidence: EvidenceItem) -> float:
+    paragraph_tokens = set(_tokenize_for_match(paragraph))
+    evidence_tokens = set(_tokenize_for_match(evidence.get("content", "")))
+
+    if not paragraph_tokens or not evidence_tokens:
+        return 0.0
+
+    overlap = paragraph_tokens & evidence_tokens
+    base = len(overlap) / max(1, len(paragraph_tokens))
+    semantic_hint = float(evidence.get("score", 0.0)) if evidence.get("score") is not None else 0.0
+    return base + min(semantic_hint, 1.0) * 0.1
+
+
+def _citation_label(evidence: EvidenceItem) -> str:
+    source_id = evidence.get("source_id", "").strip()
+    source_name = evidence.get("source_name", "").strip()
+
+    if source_id:
+        return source_id
+    if source_name:
+        return source_name
+    return "unknown_source"
+
+
+def _is_substantive_paragraph(paragraph: str, force_reason: str) -> bool:
+    cleaned = paragraph.strip()
+    if not cleaned:
+        return False
+    if force_reason and cleaned == force_reason.strip():
+        return False
+    return len(_tokenize_for_match(cleaned)) >= 6
+
+
+def _mentions_limitations(text: str) -> bool:
+    lowered = text.lower()
+    markers = [
+        "mock",
+        "模拟",
+        "限制",
+        "非实时",
+        "最佳努力",
+        "当前信息",
+        "不完全",
+        "可能",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
 def planner(state: AgentState) -> AgentState:
     """
     planner 节点。
@@ -138,7 +231,7 @@ def planner(state: AgentState) -> AgentState:
     llm = get_chat_model().with_structured_output(PlannerDecision)
 
     next_iteration = state["iteration_count"] + 1
-    elapsed_seconds = max(0.0, time.time() - state["started_at"])
+    elapsed_seconds = max(0.0, time.time() - state["started_at_ts"])
     checker_feedback = state["checker_result"].get("feedback", "")
     subtasks_text = _format_subtasks(state["subtasks"])
     current_answer = state["answer_draft"].strip() or "None"
@@ -174,14 +267,14 @@ def planner(state: AgentState) -> AgentState:
         "force_answer_reason": "",
     }
 
-    if elapsed_seconds >= state["max_duration_seconds"] and decision.decision == "dispatch":
+    if elapsed_seconds >= state["max_duration_seconds"] and decision.decision != "finish":
         planner_control["decision"] = "answer"
         planner_control["planner_note"] = "达到最大思考时长，转入回答生成。"
         planner_control["force_answer_reason"] = (
             f"已达到最大思考时长限制（{state['max_duration_seconds']} 秒），"
             "系统需要基于当前信息给出最佳努力回答。"
         )
-    elif next_iteration >= state["max_iterations"] and decision.decision == "dispatch":
+    elif next_iteration >= state["max_iterations"] and decision.decision != "finish":
         planner_control["decision"] = "answer"
         planner_control["planner_note"] = "达到最大迭代次数，转入回答生成。"
         planner_control["force_answer_reason"] = (
@@ -314,7 +407,7 @@ def search_agent(state: AgentState) -> AgentState:
         "title": "Mock Search Result",
         "content": result,
         "score": 1.0,
-        "metadata": {"query": query},
+        "metadata": {"query": query, "degraded": True},
     }
 
     updated_task: SubTask = {
@@ -347,7 +440,7 @@ def action_agent(state: AgentState) -> AgentState:
     action_input = task.get("question", "").strip()
 
     tool_name = "mock_action"
-    result = f"Mock action executed successfully for task: {action_input}"
+    result = _maybe_mock_action_result(action_input)
     observation = "执行子任务已通过 mock action 完成。"
 
     evidence: EvidenceItem = {
@@ -357,7 +450,7 @@ def action_agent(state: AgentState) -> AgentState:
         "title": "Mock Action Result",
         "content": result,
         "score": 1.0,
-        "metadata": {"action_input": action_input},
+        "metadata": {"action_input": action_input, "degraded": True},
     }
 
     updated_task: SubTask = {
@@ -423,15 +516,185 @@ def answer_generator(state: AgentState) -> AgentState:
         f"tasks={len(state['subtasks'])} | "
         f"done={sum(1 for task in state['subtasks'] if task.get('status') == 'done')} | "
         f"tools={','.join(state['used_tools']) if state['used_tools'] else 'None'} | "
-        f"elapsed={max(0.0, time.time() - state['started_at']):.1f}s"
+        f"elapsed={max(0.0, time.time() - state['started_at_ts']):.1f}s"
     )
 
     return {
         **state,
         "answer_draft": answer_text,
+        "grounded_answer": "",
+        "citations": [],
+        "verification_result": {
+            "needs_revision": False,
+            "citation_coverage": 0.0,
+            "confidence": 0.0,
+            "supported_paragraphs": 0,
+            "total_paragraphs": 0,
+            "unsupported_claims": [],
+            "degraded_citations": [],
+            "summary": "",
+        },
         "trace_summary": trace_summary,
-        "observation": "已生成答案草稿，等待 checker 校验。",
+        "observation": "已生成答案草稿，等待引用映射与校验。",
         "intermediate_steps": _append_step(state, "answer_generator", question, "draft generated"),
+    }
+
+
+def citation_mapper(state: AgentState) -> AgentState:
+    """将答案草稿的段落映射到最相关的证据，并补充引用标记。"""
+    paragraphs = _split_paragraphs(state["answer_draft"])
+    evidence_items = state["evidence"]
+    force_reason = state["planner_control"].get("force_answer_reason", "").strip()
+
+    grounded_parts: list[str] = []
+    citations: list[CitationItem] = []
+
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        if not _is_substantive_paragraph(paragraph, force_reason):
+            grounded_parts.append(paragraph)
+            continue
+
+        scored = sorted(
+            (
+                (
+                    _support_score(paragraph, evidence),
+                    evidence,
+                )
+                for evidence in evidence_items
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+
+        matched = [
+            (score, evidence)
+            for score, evidence in scored[:2]
+            if score > 0
+        ]
+
+        # Single-evidence answers are often short paraphrases; keep one fallback citation.
+        if not matched and len(evidence_items) == 1:
+            matched = [(0.01, evidence_items[0])]
+
+        if not matched:
+            grounded_parts.append(paragraph)
+            continue
+
+        labels: list[str] = []
+        for score, evidence in matched:
+            label = _citation_label(evidence)
+            labels.append(label)
+            citations.append(
+                {
+                    "paragraph_index": paragraph_index,
+                    "label": label,
+                    "source_type": evidence.get("source_type", "tool"),
+                    "source_name": evidence.get("source_name", ""),
+                    "source_id": evidence.get("source_id", ""),
+                    "title": evidence.get("title", ""),
+                    "snippet": evidence.get("content", "")[:180],
+                    "score": round(score, 4),
+                    "degraded": bool(evidence.get("metadata", {}).get("degraded", False)),
+                }
+            )
+
+        citation_text = " ".join(f"[{label}]" for label in labels)
+        grounded_parts.append(f"{paragraph} {citation_text}")
+
+    grounded_answer = "\n\n".join(grounded_parts).strip()
+
+    return {
+        **state,
+        "grounded_answer": grounded_answer,
+        "citations": citations,
+        "observation": "已完成答案段落与证据的引用映射。",
+        "intermediate_steps": _append_step(
+            state,
+            "citation_mapper",
+            state["question"],
+            f"mapped {len(citations)} citations",
+        ),
+    }
+
+
+def verifier(state: AgentState) -> AgentState:
+    """对 grounded answer 做轻量引用覆盖与支持度校验。"""
+    answer_text = state["grounded_answer"].strip() or state["answer_draft"].strip()
+    paragraphs = _split_paragraphs(answer_text)
+    force_reason = state["planner_control"].get("force_answer_reason", "").strip()
+
+    citations_by_paragraph: dict[int, list[CitationItem]] = {}
+    for citation in state["citations"]:
+        paragraph_index = int(citation.get("paragraph_index", -1))
+        citations_by_paragraph.setdefault(paragraph_index, []).append(citation)
+
+    total_paragraphs = 0
+    supported_paragraphs = 0
+    unsupported_claims: list[str] = []
+    degraded_citations: list[str] = []
+
+    for paragraph_index, paragraph in enumerate(paragraphs):
+        if not _is_substantive_paragraph(paragraph, force_reason):
+            continue
+
+        total_paragraphs += 1
+        paragraph_citations = citations_by_paragraph.get(paragraph_index, [])
+
+        if paragraph_citations:
+            supported_paragraphs += 1
+            for citation in paragraph_citations:
+                if citation.get("degraded"):
+                    degraded_citations.append(citation.get("label", "unknown_source"))
+        else:
+            unsupported_claims.append(paragraph)
+
+    citation_coverage = (
+        supported_paragraphs / total_paragraphs if total_paragraphs else 1.0
+    )
+    mentions_limits = _mentions_limitations(answer_text)
+    degraded_ack_ok = not degraded_citations or mentions_limits
+    needs_revision = bool(unsupported_claims) or citation_coverage < 0.8 or not degraded_ack_ok
+
+    confidence = citation_coverage * 0.7
+    if not unsupported_claims:
+        confidence += 0.2
+    if degraded_ack_ok:
+        confidence += 0.1
+    confidence = round(min(confidence, 1.0), 3)
+
+    summary_parts = [
+        f"citation_coverage={citation_coverage:.2f}",
+        f"supported_paragraphs={supported_paragraphs}/{total_paragraphs}",
+    ]
+    if degraded_citations:
+        summary_parts.append(f"degraded_sources={','.join(sorted(set(degraded_citations)))}")
+    if unsupported_claims:
+        summary_parts.append("存在未被引用支持的段落")
+    if not degraded_ack_ok:
+        summary_parts.append("答案使用了降级来源，但没有明确说明限制")
+
+    verification_result = {
+        "needs_revision": needs_revision,
+        "citation_coverage": round(citation_coverage, 3),
+        "confidence": confidence,
+        "supported_paragraphs": supported_paragraphs,
+        "total_paragraphs": total_paragraphs,
+        "unsupported_claims": unsupported_claims,
+        "degraded_citations": sorted(set(degraded_citations)),
+        "summary": " | ".join(summary_parts),
+    }
+
+    return {
+        **state,
+        "verification_result": verification_result,
+        "trace_summary": f"{state['trace_summary']} | coverage={citation_coverage:.2f} | confidence={confidence:.2f}",
+        "observation": "已完成轻量引用覆盖与支持度校验。",
+        "intermediate_steps": _append_step(
+            state,
+            "verifier",
+            state["question"],
+            verification_result["summary"],
+        ),
     }
 
 
@@ -439,6 +702,7 @@ def checker(state: AgentState) -> AgentState:
     """检查答案草稿是否可以输出，否则返回 planner 补充信息。"""
     question = state["question"].strip()
     force_reason = state["planner_control"].get("force_answer_reason", "").strip()
+    final_answer_candidate = state["grounded_answer"].strip() or state["answer_draft"].strip()
 
     if force_reason:
         return {
@@ -448,14 +712,38 @@ def checker(state: AgentState) -> AgentState:
                 "feedback": force_reason,
                 "pass_reason": "forced_budget_pass",
             },
-            "answer": state["answer_draft"].strip(),
+            "answer": final_answer_candidate,
             "status": "finished",
+            "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "observation": "因达到流程限制条件，checker 直接放行当前最佳努力答案。",
             "intermediate_steps": _append_step(
                 state,
                 "checker",
                 question,
                 f"forced pass: {force_reason}",
+            ),
+        }
+
+    verification_result = state["verification_result"]
+    if verification_result.get("needs_revision", False):
+        feedback = (
+            verification_result.get("summary", "引用覆盖不足或存在未支持结论。")
+        )
+        return {
+            **state,
+            "checker_result": {
+                "passed": False,
+                "feedback": feedback,
+                "pass_reason": "quality_fail",
+            },
+            "answer": "",
+            "status": "running",
+            "observation": "verifier 发现引用或支持度不足，返回 planner 补充信息。",
+            "intermediate_steps": _append_step(
+                state,
+                "checker",
+                question,
+                feedback,
             ),
         }
 
@@ -468,15 +756,19 @@ def checker(state: AgentState) -> AgentState:
             content=(
                 f"用户问题：{question}\n\n"
                 f"答案草稿：\n{state['answer_draft'] or 'None'}\n\n"
+                f"带引用答案：\n{state['grounded_answer'] or 'None'}\n\n"
                 f"子任务执行情况：\n{_format_subtasks(state['subtasks'])}\n\n"
-                f"汇总上下文：\n{state['aggregated_context'] or 'None'}\n"
+                f"汇总上下文：\n{state['aggregated_context'] or 'None'}\n\n"
+                f"引用校验摘要：{verification_result.get('summary', 'None')}\n"
+                f"引用覆盖率：{verification_result.get('citation_coverage', 0.0)}\n"
+                f"置信度：{verification_result.get('confidence', 0.0)}\n"
             )
         ),
     ]
 
     decision = llm.invoke(messages)
     status = "finished" if decision.passed else "running"
-    answer = state["answer_draft"] if decision.passed else ""
+    answer = final_answer_candidate if decision.passed else ""
 
     return {
         **state,
@@ -487,6 +779,7 @@ def checker(state: AgentState) -> AgentState:
         },
         "answer": answer,
         "status": status,
+        "finished_at": datetime.now().astimezone().isoformat(timespec="seconds") if decision.passed else "",
         "observation": "checker 通过，准备输出最终答案。" if decision.passed else "checker 未通过，返回 planner。",
         "intermediate_steps": _append_step(
             state,

@@ -63,6 +63,9 @@ def assert_common_shape(data: dict[str, Any]) -> None:
         "retrieved_sources",
         "used_tools",
         "answer_draft",
+        "grounded_answer",
+        "citations",
+        "verification_result",
         "checker_result",
         "trace_summary",
         "iteration_count",
@@ -80,12 +83,20 @@ def assert_common_shape(data: dict[str, Any]) -> None:
         raise AssertionError("subtasks must be a list")
     if not isinstance(data["evidence"], list):
         raise AssertionError("evidence must be a list")
+    if not isinstance(data["citations"], list):
+        raise AssertionError("citations must be a list")
+    if not isinstance(data["verification_result"], dict):
+        raise AssertionError("verification_result must be a dict")
     if not isinstance(data["checker_result"], dict):
         raise AssertionError("checker_result must be a dict")
     if data["status"] != "finished":
         raise AssertionError(f"workflow did not finish, status={data['status']}")
     if not data["answer"]:
         raise AssertionError("final answer is empty")
+    if not data["grounded_answer"]:
+        raise AssertionError("grounded_answer is empty")
+    if data["evidence"] and not data["citations"]:
+        raise AssertionError("citations should not be empty when evidence exists")
 
 
 def assert_task_type_present(data: dict[str, Any], expected_task_type: str) -> None:

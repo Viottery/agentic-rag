@@ -24,6 +24,8 @@ user input
   -> rag_agent / search_agent / action_agent
   -> planner
   -> answer_generator
+  -> citation_mapper
+  -> verifier
   -> checker
   -> END or back to planner
 ```
@@ -36,6 +38,8 @@ Current execution characteristics:
 - `search_agent` is still mock, but returns a structured pseudo-search summary
 - `action_agent` is still mock, but returns a structured pseudo-execution result
 - `answer_generator` writes an answer draft
+- `citation_mapper` maps answer paragraphs to evidence and attaches source labels
+- `verifier` performs lightweight citation coverage and unsupported-section checks
 - `checker` decides whether the draft can be returned
 
 More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md).
@@ -59,7 +63,8 @@ When the planner wants to continue dispatching but one of these limits has alrea
 1. The workflow stops creating new work.
 2. It is forced into `answer_generator`.
 3. The answer draft is prefixed with a clear limitation notice.
-4. `checker` marks the result as a forced budget pass and returns the best-effort answer.
+4. `citation_mapper` and `verifier` still run so the result keeps grounding metadata.
+5. `checker` marks the result as a forced budget pass and returns the best-effort answer.
 
 This gives the system a predictable fallback:
 
@@ -81,6 +86,9 @@ Important top-level fields include:
 - `aggregated_context`
 - `evidence`
 - `answer_draft`
+- `grounded_answer`
+- `citations`
+- `verification_result`
 - `checker_result`
 - `trace_summary`
 - `iteration_count`
@@ -111,6 +119,7 @@ Current design tradeoff:
 - `search_agent` is still mock and does not perform real web search.
 - `action_agent` is still mock and does not perform real external actions.
 - Retrieval is still baseline vector search.
+- Citation mapping and verification are currently lightweight heuristic checks, not full claim-level factual verification.
 - `aggregated_context` and some global fields duplicate information that also exists inside `subtasks`.
 - The workflow is serial today; the dispatcher is structured for future parallel expansion, but fan-out/fan-in is not implemented yet.
 - The checker currently distinguishes quality pass vs budget-forced pass, but deeper failure taxonomy is still basic.

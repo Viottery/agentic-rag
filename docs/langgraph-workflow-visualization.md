@@ -36,10 +36,12 @@ flowchart TD
     F --> A
     H --> A
 
-    G --> I[checker]
-    I -->|quality pass| J[END]
-    I -->|quality fail| A
-    I -->|forced budget pass| J
+    G --> I[citation_mapper]
+    I --> J[verifier]
+    J --> K[checker]
+    K -->|quality pass| L[END]
+    K -->|quality fail| A
+    K -->|forced budget pass| L
 ```
 
 这条链路表达的是：
@@ -51,6 +53,8 @@ flowchart TD
   -> 子 agent 执行
   -> 回到 planner 复盘
   -> answer_generator 生成答案草稿
+  -> citation_mapper 补引用
+  -> verifier 做轻量支持度检查
   -> checker 审核
   -> 正常通过则输出
   -> 未通过则回到 planner
@@ -143,6 +147,36 @@ flowchart TD
 - 基于 `aggregated_context + evidence + subtasks` 生成 `answer_draft`
 - 若 planner 已判定达到预算限制，会在答案前附加限制说明
 
+### citation_mapper
+
+职责：
+
+- 将 `answer_draft` 按段落拆分
+- 为每个关键段落映射最相关的 evidence
+- 生成 `grounded_answer`
+- 生成结构化 `citations`
+
+当前实现特点：
+
+- 使用轻量规则做段落级引用映射
+- 不额外调用 LLM
+- 优先控制 token 消耗与响应速度
+
+### verifier
+
+职责：
+
+- 检查关键段落是否带引用
+- 计算 `citation_coverage`
+- 标记 `unsupported_claims`
+- 识别是否引用了降级来源
+- 输出 `verification_result`
+
+当前实现特点：
+
+- 是轻量启发式校验，不是完整 claim-level fact checking
+- 目标是先快速过滤掉明显不可信的回答
+
 ### checker
 
 职责：
@@ -162,6 +196,8 @@ flowchart TD
 说明：
 
 - `checker` 的主审核逻辑仍保留
+- 但它现在会先消费 `verification_result`
+- 当 verifier 判断引用覆盖不足或存在未支持段落时，会直接打回 planner
 - 只有在预算限制已触发时，才会直接放行当前最佳努力答案
 
 ## 4. 当前状态结构
@@ -177,6 +213,9 @@ flowchart TD
 - `aggregated_context`
 - `evidence`
 - `answer_draft`
+- `grounded_answer`
+- `citations`
+- `verification_result`
 - `checker_result`
 - `trace_summary`
 - `started_at`
@@ -213,6 +252,15 @@ flowchart TD
 - `feedback`
 - `pass_reason`
 
+`VerificationResult` 重点字段：
+
+- `needs_revision`
+- `citation_coverage`
+- `confidence`
+- `unsupported_claims`
+- `degraded_citations`
+- `summary`
+
 ## 5. 当前降级策略
 
 当前系统采用“预算驱动的最佳努力回答”。
@@ -227,6 +275,7 @@ flowchart TD
 - 只有当 planner 想继续 `dispatch` 时，预算限制才会真正截断探索
 - 一旦触发，planner 会改为进入 `answer_generator`
 - `answer_generator` 会把限制原因写进答案草稿
+- `citation_mapper` 与 `verifier` 仍会运行
 - `checker` 看到这是强制回答后，会以 `forced_budget_pass` 放行
 
 这套策略解决的问题：
@@ -234,6 +283,7 @@ flowchart TD
 - 防无限回环
 - 防过量 LLM 调用
 - 在 search/action 仍为 mock 时，避免系统为了“拿不到的真实信息”反复空转
+- 即使进入最佳努力回答，也尽量保留引用与支持度信息
 
 这套策略的代价：
 
@@ -285,6 +335,8 @@ flowchart TD
 
 - `search_agent` 不是真实外网搜索
 - `action_agent` 不是真实执行器
+- `citation_mapper` 目前是段落级引用映射，不是句级引用
+- `verifier` 目前是轻量启发式检查，不是完整事实核验器
 - `aggregated_context`、全局 `evidence` 与 `subtasks[*].result/evidence` 之间仍有信息重复
 - 预算限制目前是全局的，缺少更细的节点级超时治理
 - `checker` 的失败类型还不够细
@@ -319,10 +371,10 @@ flowchart TD
 
 - `app/agent/graph.py`
   - 定义 supervisor 风格 LangGraph
-  - 负责 planner、dispatcher、各子 agent、checker 的路由
+  - 负责 planner、dispatcher、各子 agent、citation_mapper、verifier、checker 的路由
 
 - `app/agent/nodes.py`
-  - 实现 planner / dispatcher / rag_agent / search_agent / action_agent / answer_generator / checker
+  - 实现 planner / dispatcher / rag_agent / search_agent / action_agent / answer_generator / citation_mapper / verifier / checker
 
 - `app/rag/retriever.py`
   - 保留现有知识库检索能力

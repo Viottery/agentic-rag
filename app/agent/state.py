@@ -22,6 +22,20 @@ class EvidenceItem(TypedDict, total=False):
     metadata: Dict[str, Any]
 
 
+class CitationItem(TypedDict, total=False):
+    """答案段落映射出的引用项。"""
+
+    paragraph_index: int
+    label: str
+    source_type: Literal["local_kb", "tool"]
+    source_name: str
+    source_id: str
+    title: str
+    snippet: str
+    score: float
+    degraded: bool
+
+
 class SubTask(TypedDict, total=False):
     """planner 拆分出的子任务。"""
 
@@ -55,6 +69,19 @@ class CheckerResult(TypedDict, total=False):
     pass_reason: Literal["quality_pass", "forced_budget_pass", "quality_fail"]
 
 
+class VerificationResult(TypedDict, total=False):
+    """引用与支持度校验结果。"""
+
+    needs_revision: bool
+    citation_coverage: float
+    confidence: float
+    supported_paragraphs: int
+    total_paragraphs: int
+    unsupported_claims: List[str]
+    degraded_citations: List[str]
+    summary: str
+
+
 class AgentState(TypedDict):
     """
     Agent 运行时共享状态。
@@ -86,11 +113,16 @@ class AgentState(TypedDict):
 
     # answer generation / validation
     answer_draft: str
+    grounded_answer: str
+    citations: List[CitationItem]
+    verification_result: VerificationResult
     checker_result: CheckerResult
     trace_summary: str
 
     # runtime control
-    started_at: float
+    started_at: str
+    started_at_ts: float
+    finished_at: str
     iteration_count: int
     max_iterations: int
     max_duration_seconds: int

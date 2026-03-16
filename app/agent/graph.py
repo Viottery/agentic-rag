@@ -4,10 +4,12 @@ from app.agent.nodes import (
     action_agent,
     answer_generator,
     checker,
+    citation_mapper,
     dispatcher,
     planner,
     rag_agent,
     search_agent,
+    verifier,
 )
 from app.agent.state import AgentState
 
@@ -49,8 +51,8 @@ def build_graph():
           ├─ dispatcher -> rag_agent    -> planner
           ├─ dispatcher -> search_agent -> planner
           ├─ dispatcher -> action_agent -> planner
-          ├─ answer_generator -> checker -> END
-          └─ answer_generator -> checker -> planner
+          ├─ answer_generator -> citation_mapper -> verifier -> checker -> END
+          └─ answer_generator -> citation_mapper -> verifier -> checker -> planner
     """
     graph = StateGraph(AgentState)
 
@@ -60,6 +62,8 @@ def build_graph():
     graph.add_node("search_agent", search_agent)
     graph.add_node("action_agent", action_agent)
     graph.add_node("answer_generator", answer_generator)
+    graph.add_node("citation_mapper", citation_mapper)
+    graph.add_node("verifier", verifier)
     graph.add_node("checker", checker)
 
     graph.set_entry_point("planner")
@@ -88,7 +92,9 @@ def build_graph():
     graph.add_edge("rag_agent", "planner")
     graph.add_edge("search_agent", "planner")
     graph.add_edge("action_agent", "planner")
-    graph.add_edge("answer_generator", "checker")
+    graph.add_edge("answer_generator", "citation_mapper")
+    graph.add_edge("citation_mapper", "verifier")
+    graph.add_edge("verifier", "checker")
 
     graph.add_conditional_edges(
         "checker",

@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
 import time
@@ -23,6 +24,9 @@ def chat(req: ChatRequest) -> dict:
     负责构造初始状态并调用 LangGraph。
     """
     settings = get_settings()
+
+    started_at_ts = time.time()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
 
     initial_state: AgentState = {
         # user input
@@ -52,6 +56,18 @@ def chat(req: ChatRequest) -> dict:
  
         # answer generation / validation
         "answer_draft": "",
+        "grounded_answer": "",
+        "citations": [],
+        "verification_result": {
+            "needs_revision": False,
+            "citation_coverage": 0.0,
+            "confidence": 0.0,
+            "supported_paragraphs": 0,
+            "total_paragraphs": 0,
+            "unsupported_claims": [],
+            "degraded_citations": [],
+            "summary": "",
+        },
         "checker_result": {
             "passed": False,
             "feedback": "",
@@ -60,7 +76,9 @@ def chat(req: ChatRequest) -> dict:
         "trace_summary": "",
 
         # runtime control
-        "started_at": time.time(),
+        "started_at": started_at,
+        "started_at_ts": started_at_ts,
+        "finished_at": "",
         "iteration_count": 0,
         "max_iterations": settings.agent_max_iterations,
         "max_duration_seconds": settings.agent_max_duration_seconds,
