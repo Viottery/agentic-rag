@@ -40,6 +40,11 @@ Current execution characteristics:
 
 More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md).
 
+## Docs
+
+- [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): current LangGraph workflow, state design, degradation strategy, and known limitations
+- [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): future project direction, stage planning, and next implementation priorities
+
 ## Runtime Degradation Strategy
 
 The workflow is intentionally bounded so it does not loop forever or burn excessive model calls.
@@ -123,6 +128,7 @@ agentic-rag/
 ├── data/
 │   └── raw/         # source documents for indexing
 ├── docs/
+│   ├── future-roadmap.md
 │   └── langgraph-workflow-visualization.md
 ├── tests/
 │   ├── e2e_chat_flow.py
