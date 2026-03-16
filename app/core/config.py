@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     debug: bool = True
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
+    agent_max_iterations: int = 6
+    agent_max_duration_seconds: int = 90
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -1,102 +1,178 @@
 # Agentic-RAG
 
-Agentic-RAG is a learning-oriented backend project for building an AI agent with structured reasoning, retrieval-augmented generation, and tool execution.
-
-The project focuses on system design rather than UI. Its goal is to explore how an LLM application can evolve from a simple prompt-based chatbot into a modular agent system with explicit workflow control.
+Agentic-RAG is a learning-oriented backend project for exploring how a simple LLM app can evolve into a planner-driven multi-agent workflow with retrieval, tool delegation, answer synthesis, and guarded fallback behavior.
 
 ## Project Goal
 
-This project aims to build an Agentic RAG system based on:
+The project currently focuses on four things:
 
-- FastAPI for API delivery
-- LangGraph for workflow orchestration
-- ReAct-style reasoning for action planning
-- Qdrant for vector retrieval
-- Docker Compose for reproducible local development
+- FastAPI as the API surface
+- LangGraph as the workflow orchestrator
+- Qdrant-backed local RAG as the first real sub-agent capability
+- A supervisor-style planner loop that can dispatch subtasks and degrade gracefully under runtime limits
 
-The long-term direction is not only to support retrieval, but to grow the retrieval layer into a richer retrieval subgraph with better decomposition, routing, reranking, validation, and evidence aggregation.
+The long-term direction is to replace today's mock search and mock action agents with real tools, and to grow retrieval into a richer retrieval subgraph with rewrite, routing, reranking, validation, and evidence aggregation.
 
-## Current Status
+## Current Workflow
 
-The project is in an early but working stage.
+The current agent is no longer a single-step router. It is a serial supervisor workflow:
 
-Already implemented:
+```text
+user input
+  -> planner
+  -> dispatcher
+  -> rag_agent / search_agent / action_agent
+  -> planner
+  -> answer_generator
+  -> checker
+  -> END or back to planner
+```
 
-- FastAPI backend service
-- LangGraph-based agent workflow
-- Planner, retrieval, tool-executor, and responder nodes
-- Basic RAG indexing pipeline
-- Qdrant-backed vector search
-- Structured evidence and trace output
-- Docker-based local development environment
+Current execution characteristics:
 
-Current limitations:
+- `planner` decomposes the problem into `subtasks`
+- `dispatcher` chooses the current task and routes by `task_type`
+- `rag_agent` is real and reads from the local knowledge base
+- `search_agent` is still mock, but returns a structured pseudo-search summary
+- `action_agent` is still mock, but returns a structured pseudo-execution result
+- `answer_generator` writes an answer draft
+- `checker` decides whether the draft can be returned
 
-- Retrieval is still a baseline vector-search implementation
-- Tool execution is still mocked
-- Retrieval does not yet include query rewrite, reranking, hybrid search, or evidence validation
-- There is not yet an automatic startup indexing flow
+More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md).
 
-## Architecture
+## Runtime Degradation Strategy
 
-The current workflow is:
+The workflow is intentionally bounded so it does not loop forever or burn excessive model calls.
 
-Client
-  -> FastAPI
-  -> LangGraph agent
-     -> planner
-     -> retrieve or tool_executor
-     -> responder
+Two runtime limits are enforced:
 
-The retrieval path is:
+- `AGENT_MAX_ITERATIONS`
+- `AGENT_MAX_DURATION_SECONDS`
 
-Raw text files
-  -> indexing
-  -> embeddings
-  -> Qdrant
-  -> retriever
-  -> agent retrieve node
-  -> responder
+When the planner wants to continue dispatching but one of these limits has already been reached:
+
+1. The workflow stops creating new work.
+2. It is forced into `answer_generator`.
+3. The answer draft is prefixed with a clear limitation notice.
+4. `checker` marks the result as a forced budget pass and returns the best-effort answer.
+
+This gives the system a predictable fallback:
+
+- normal case: `quality_pass`
+- degraded case: `forced_budget_pass`
+- insufficient case before fallback: `quality_fail`
+
+This is a deliberate tradeoff. It favors bounded execution and observability over perfect completeness.
+
+## State Design
+
+The `/chat` endpoint currently returns the full `AgentState` because the project is still in workflow-validation mode.
+
+Important top-level fields include:
+
+- `subtasks`
+- `planner_control`
+- `current_task`
+- `aggregated_context`
+- `evidence`
+- `answer_draft`
+- `checker_result`
+- `trace_summary`
+- `iteration_count`
+- `max_iterations`
+- `max_duration_seconds`
+- `answer`
+- `status`
+
+Important subtask fields include:
+
+- `task_id`
+- `task_type`
+- `status`
+- `result`
+- `evidence`
+- `error`
+- `degraded`
+- `degraded_reason`
+
+Current design tradeoff:
+
+- It is more verbose than a production state model.
+- That is intentional for now because it makes planning loops, mock boundaries, and fallback behavior easier to inspect.
+- Later, some global derived fields can be slimmed down once behavior is stable.
+
+## Current Limitations
+
+- `search_agent` is still mock and does not perform real web search.
+- `action_agent` is still mock and does not perform real external actions.
+- Retrieval is still baseline vector search.
+- `aggregated_context` and some global fields duplicate information that also exists inside `subtasks`.
+- The workflow is serial today; the dispatcher is structured for future parallel expansion, but fan-out/fan-in is not implemented yet.
+- The checker currently distinguishes quality pass vs budget-forced pass, but deeper failure taxonomy is still basic.
 
 ## Project Structure
 
 ```text
 agentic-rag/
 ├── app/
-│   ├── agent/       # LangGraph workflow, nodes, prompts, state
+│   ├── agent/       # LangGraph workflow, nodes, prompts, state, schemas
 │   ├── api/         # FastAPI routes and schemas
 │   ├── core/        # configuration
 │   ├── rag/         # indexing, embeddings, qdrant store, retriever, cli
 │   └── tools/       # future external tools
 ├── data/
 │   └── raw/         # source documents for indexing
+├── docs/
+│   └── langgraph-workflow-visualization.md
+├── tests/
+│   ├── e2e_chat_flow.py
+│   └── run_full_stack_smoke.sh
 ├── docker-compose.yml
 ├── dockerfile
 ├── requirements.txt
 └── README.MD
 ```
 
-## How To Run
+## Configuration
 
-Start the services:
+Important environment variables:
 
-```bash
-docker compose up --build
+```env
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=...
+OPENAI_MODEL=...
+OPENAI_TEMPERATURE=0
+
+AGENT_MAX_ITERATIONS=6
+AGENT_MAX_DURATION_SECONDS=90
 ```
 
-Build the knowledge base index from local text files:
+For model download acceleration inside Docker, the project currently uses:
+
+- `HF_ENDPOINT=https://hf-mirror.com`
+- host-mounted Hugging Face caches via `docker-compose.yml`
+
+## Run Locally
+
+Start services:
+
+```bash
+docker compose up -d app
+```
+
+Index local files:
 
 ```bash
 docker compose exec app python -m app.rag.cli index-dir data/raw
 ```
 
-Check whether Qdrant has indexed points:
+Check Qdrant:
 
 ```bash
 docker compose exec app python -m app.rag.cli check
 ```
 
-Send a chat request:
+Send a sample request:
 
 ```bash
 curl -X POST "http://localhost:8000/chat" \
@@ -106,44 +182,35 @@ curl -X POST "http://localhost:8000/chat" \
   }'
 ```
 
-## What The Chat API Returns
+## Test
 
-The `/chat` endpoint currently returns the full agent state, including:
+Run the lightweight end-to-end test cases:
 
-- `answer`
-- `retrieved_docs`
-- `retrieved_sources`
-- `evidence`
-- `intermediate_steps`
-- `trace_summary`
-- `error`
+```bash
+python tests/e2e_chat_flow.py --base-url http://127.0.0.1:8000
+```
 
-This is intentionally verbose in the current stage because the project is still focused on workflow validation and observability.
+Run the full smoke flow:
 
-## Retrieval Design Direction
+```bash
+bash tests/run_full_stack_smoke.sh
+```
 
-The current retrieval implementation is intentionally simple and maintainable:
+These tests currently validate:
 
-- character-based chunking
-- local embedding generation
-- vector search in Qdrant
-- evidence mapping back into agent state
-
-This baseline is meant to be replaced incrementally by a more capable retrieval subgraph that may later support:
-
-- query analysis
-- sub-question decomposition
-- source routing
-- reranking
-- evidence validation
-- evidence aggregation
+- `rag` flow
+- `search` mock flow
+- `action` mock flow
+- response shape
+- completion status
+- subtask type routing
 
 ## Development Notes
 
-- The raw documents under `data/raw` are not automatically indexed on startup
-- If you update source files, rerun the indexing command
-- Qdrant point IDs are stored as stable UUID mappings, while business-facing `chunk_id` values are preserved in payloads
-- The code intentionally marks some baseline or naive implementations with comments so they can be upgraded later without changing the public module boundaries
+- If you update source documents under `data/raw`, rerun the indexing command.
+- The raw documents are not indexed automatically on startup.
+- Because search and action are still mocked, prompts and tests should avoid pretending they are real production integrations.
+- The current system is intentionally explicit about intermediate state so planner/checker behavior can be debugged before the workflow is slimmed down.
 
 ## License
 

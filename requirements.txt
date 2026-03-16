@@ -4,6 +4,6 @@ langchain
 pydantic-settings
 qdrant-client
 pytest
-httpx
+httpx>=0.27,<1
 langchain-openai
 sentence-transformers

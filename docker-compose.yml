@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        PIP_INDEX_URL: https://mirrors.nju.edu.cn/pypi/web/simple
     container_name: agentic-rag-app
     working_dir: /workspace
     command: fastapi dev app/main.py --host 0.0.0.0 --port 8000
@@ -10,6 +12,8 @@ services:
       - "8000:8000"
     volumes:
       - ./:/workspace
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+      - ${HOME}/.cache/sentence_transformers:/root/.cache/sentence_transformers
     environment:
       APP_NAME: Agentic RAG
       APP_ENV: dev
@@ -20,6 +24,10 @@ services:
       OPENAI_BASE_URL: ${OPENAI_BASE_URL}
       OPENAI_MODEL: ${OPENAI_MODEL}
       OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE}
+      HF_ENDPOINT: https://hf-mirror.com
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface/hub
+      SENTENCE_TRANSFORMERS_HOME: /root/.cache/sentence_transformers
     depends_on:
       - qdrant
 

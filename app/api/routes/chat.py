@@ -1,8 +1,10 @@
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
+import time
 
 from app.agent.graph import agent_graph
 from app.agent.state import AgentState
+from app.core.config import get_settings
 
 router = APIRouter(tags=["chat"])
 
@@ -20,33 +22,48 @@ def chat(req: ChatRequest) -> dict:
 
     负责构造初始状态并调用 LangGraph。
     """
+    settings = get_settings()
+
     initial_state: AgentState = {
         # user input
         "question": req.question,
         "messages": [],
 
-        # react core
+        # planner / orchestration
         "thought": "",
-        "next_action": "",
-        "action_input": "",
-        "observation": "",
+        "subtasks": [],
+        "planner_control": {
+            "decision": "dispatch",
+            "selected_task_id": "",
+            "planner_note": "",
+            "checker_feedback": "",
+            "force_answer_reason": "",
+        },
+        "current_task": {},
+        "intermediate_steps": [],
 
-        # retrieval / tool raw outputs
-        "retrieved_docs": [],
-        "tool_result": "",
-
-        # structured evidence
+        # aggregated execution context
+        "aggregated_context": "",
         "evidence": [],
+        "retrieved_docs": [],
         "retrieved_sources": [],
         "used_tools": [],
-
-        # trace
-        "intermediate_steps": [],
+        "observation": "",
+ 
+        # answer generation / validation
+        "answer_draft": "",
+        "checker_result": {
+            "passed": False,
+            "feedback": "",
+            "pass_reason": "quality_fail",
+        },
         "trace_summary": "",
 
         # runtime control
+        "started_at": time.time(),
         "iteration_count": 0,
-        "max_iterations": 3,
+        "max_iterations": settings.agent_max_iterations,
+        "max_duration_seconds": settings.agent_max_duration_seconds,
         "error": "",
 
         # final output
