@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import re
+from collections import Counter
 from typing import Any
 
 from app.rag.embeddings import embed_query
@@ -8,29 +11,337 @@ from app.rag.schemas import RetrievedItem
 
 
 DEFAULT_TOP_K = 3
+VECTOR_CANDIDATE_MULTIPLIER = 4
+BM25_CANDIDATE_LIMIT = 4000
+BM25_K1 = 1.5
+BM25_B = 0.75
+RRF_K = 60.0
+DOCUMENT_FOCUS_TOP_DOCS = 2
+DOCUMENT_FOCUS_CANDIDATE_LIMIT = 256
+
+
+def _tokenize_for_bm25(text: str) -> list[str]:
+    cleaned = text.lower()
+    tokens: list[str] = []
+
+    for token in re.findall(r"[a-z0-9_/-]{2,}", cleaned):
+        tokens.append(token)
+
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        if len(chunk) <= 4:
+            tokens.append(chunk)
+        else:
+            tokens.append(chunk[:4])
+        if len(chunk) >= 2:
+            tokens.extend(chunk[index : index + 2] for index in range(len(chunk) - 1))
+
+    return tokens
+
+
+def _title_text(item: RetrievedItem) -> str:
+    file_stem = str(item.metadata.get("file_stem", "")).strip()
+    relative_path = str(item.metadata.get("relative_path", "")).strip()
+    parts = [item.title.strip(), file_stem, relative_path]
+    return " ".join(part for part in parts if part)
+
+
+def _query_tokens(query: str) -> list[str]:
+    return _tokenize_for_bm25(query)
+
+
+def _title_match_strength(query_tokens: list[str], item: RetrievedItem) -> float:
+    title_text = _title_text(item).lower()
+    if not title_text:
+        return 0.0
+
+    score = 0.0
+    seen_tokens: set[str] = set()
+    for token in query_tokens:
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        if len(token) <= 1:
+            continue
+        if token.lower() in title_text:
+            score += 1.0
+    return score
+
+
+def _compute_bm25_scores(
+    query_tokens: list[str],
+    documents: list[list[str]],
+    *,
+    k1: float = BM25_K1,
+    b: float = BM25_B,
+) -> list[float]:
+    if not query_tokens or not documents:
+        return [0.0 for _ in documents]
+
+    document_count = len(documents)
+    document_frequencies: Counter[str] = Counter()
+    document_term_frequencies: list[Counter[str]] = []
+    document_lengths: list[int] = []
+
+    for tokens in documents:
+        token_counter = Counter(tokens)
+        document_term_frequencies.append(token_counter)
+        document_lengths.append(len(tokens))
+        for token in token_counter.keys():
+            document_frequencies[token] += 1
+
+    average_length = sum(document_lengths) / document_count if document_count else 0.0
+    scores: list[float] = []
+
+    for token_counter, doc_length in zip(document_term_frequencies, document_lengths):
+        score = 0.0
+        normalization = k1 * (1 - b + b * (doc_length / average_length)) if average_length > 0 else k1
+        for token in query_tokens:
+            tf = token_counter.get(token, 0)
+            if tf <= 0:
+                continue
+            df = document_frequencies.get(token, 0)
+            idf = math.log(1 + ((document_count - df + 0.5) / (df + 0.5)))
+            score += idf * ((tf * (k1 + 1)) / (tf + normalization))
+        scores.append(score)
+
+    return scores
+
+
+def _bm25_retrieve(
+    query: str,
+    candidates: list[RetrievedItem],
+    *,
+    top_k: int,
+) -> list[RetrievedItem]:
+    query_tokens = _tokenize_for_bm25(query)
+    if not query_tokens or not candidates:
+        return []
+
+    title_documents = [_tokenize_for_bm25(_title_text(item)) for item in candidates]
+    content_documents = [_tokenize_for_bm25(item.content) for item in candidates]
+
+    title_scores = _compute_bm25_scores(query_tokens, title_documents)
+    content_scores = _compute_bm25_scores(query_tokens, content_documents)
+
+    ranked: list[tuple[float, int]] = []
+    for index, item in enumerate(candidates):
+        title_score = title_scores[index]
+        content_score = content_scores[index]
+        combined_score = (2.5 * title_score) + content_score
+        if combined_score <= 0:
+            continue
+        ranked.append((combined_score, index))
+
+    ranked.sort(key=lambda entry: entry[0], reverse=True)
+
+    results: list[RetrievedItem] = []
+    for score, index in ranked[:top_k]:
+        item = candidates[index]
+        results.append(
+            RetrievedItem(
+                chunk_id=item.chunk_id,
+                document_id=item.document_id,
+                source_name=item.source_name,
+                title=item.title,
+                content=item.content,
+                score=score,
+                metadata={
+                    **item.metadata,
+                    "retrieval_channel": "bm25",
+                    "title_text": _title_text(item),
+                },
+            )
+        )
+
+    return results
+
+
+def _fuse_results(
+    vector_items: list[RetrievedItem],
+    bm25_items: list[RetrievedItem],
+    *,
+    top_k: int,
+) -> list[RetrievedItem]:
+    if top_k <= 0:
+        return []
+
+    combined: dict[str, dict[str, Any]] = {}
+
+    for rank, item in enumerate(vector_items, start=1):
+        entry = combined.setdefault(
+            item.chunk_id,
+            {
+                "item": item,
+                "rrf_score": 0.0,
+                "channels": set(),
+                "vector_score": 0.0,
+                "bm25_score": 0.0,
+            },
+        )
+        entry["rrf_score"] += 1.0 / (RRF_K + rank)
+        entry["channels"].add("vector")
+        entry["vector_score"] = max(entry["vector_score"], item.score)
+        if item.score > entry["item"].score:
+            entry["item"] = item
+
+    for rank, item in enumerate(bm25_items, start=1):
+        entry = combined.setdefault(
+            item.chunk_id,
+            {
+                "item": item,
+                "rrf_score": 0.0,
+                "channels": set(),
+                "vector_score": 0.0,
+                "bm25_score": 0.0,
+            },
+        )
+        entry["rrf_score"] += 1.0 / (RRF_K + rank)
+        entry["channels"].add("bm25")
+        entry["bm25_score"] = max(entry["bm25_score"], item.score)
+        if item.score > entry["item"].score:
+            entry["item"] = item
+
+    ranked_entries = sorted(
+        combined.values(),
+        key=lambda entry: (
+            entry["rrf_score"],
+            entry["bm25_score"],
+            entry["vector_score"],
+        ),
+        reverse=True,
+    )
+
+    fused: list[RetrievedItem] = []
+    for rank, entry in enumerate(ranked_entries[:top_k], start=1):
+        item = entry["item"]
+        fused.append(
+            RetrievedItem(
+                chunk_id=item.chunk_id,
+                document_id=item.document_id,
+                source_name=item.source_name,
+                title=item.title,
+                content=item.content,
+                score=entry["rrf_score"],
+                metadata={
+                    **item.metadata,
+                    "rank": rank,
+                    "retrieval_channels": sorted(entry["channels"]),
+                    "vector_score": entry["vector_score"],
+                    "bm25_score": entry["bm25_score"],
+                    "fused_score": entry["rrf_score"],
+                },
+            )
+        )
+
+    return fused
+
+
+def _rank_documents(
+    query: str,
+    items: list[RetrievedItem],
+) -> list[tuple[str, float]]:
+    query_tokens = _query_tokens(query)
+    document_scores: dict[str, float] = {}
+
+    for rank, item in enumerate(items, start=1):
+        if not item.document_id:
+            continue
+        base_score = 1.0 / (RRF_K + rank)
+        title_score = _title_match_strength(query_tokens, item)
+        retrieval_channels = item.metadata.get("retrieval_channels", [])
+        channel_bonus = 0.0
+        if isinstance(retrieval_channels, list) and "bm25" in retrieval_channels:
+            channel_bonus += 0.2
+        if isinstance(retrieval_channels, list) and "vector" in retrieval_channels:
+            channel_bonus += 0.1
+
+        document_scores[item.document_id] = document_scores.get(item.document_id, 0.0) + base_score + title_score + channel_bonus
+
+    return sorted(document_scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def _document_focused_retrieve(
+    query: str,
+    *,
+    top_k: int,
+    rag_store: QdrantStore,
+    document_rankings: list[tuple[str, float]],
+    source_name: str | None = None,
+    top_level_group: str | None = None,
+    hierarchy_scope: str | None = None,
+) -> list[RetrievedItem]:
+    if not document_rankings:
+        return []
+
+    query_tokens = _query_tokens(query)
+    focused_results: list[RetrievedItem] = []
+
+    for document_id, document_score in document_rankings[:DOCUMENT_FOCUS_TOP_DOCS]:
+        candidates = rag_store.scroll_items(
+            limit=DOCUMENT_FOCUS_CANDIDATE_LIMIT,
+            source_name=source_name,
+            top_level_group=top_level_group,
+            hierarchy_scope=hierarchy_scope,
+            document_id=document_id,
+        )
+        if not candidates:
+            continue
+
+        title_documents = [_tokenize_for_bm25(_title_text(item)) for item in candidates]
+        content_documents = [_tokenize_for_bm25(item.content) for item in candidates]
+        title_scores = _compute_bm25_scores(query_tokens, title_documents)
+        content_scores = _compute_bm25_scores(query_tokens, content_documents)
+
+        chunk_ranked: list[tuple[float, int]] = []
+        for index, item in enumerate(candidates):
+            title_score = title_scores[index]
+            content_score = content_scores[index]
+            chunk_index = int(item.metadata.get("chunk_index", 0) or 0)
+            position_prior = max(0.0, 1.0 - (0.03 * chunk_index))
+            combined_score = (3.0 * title_score) + content_score + document_score + position_prior
+            if combined_score <= 0:
+                continue
+            chunk_ranked.append((combined_score, index))
+
+        chunk_ranked.sort(key=lambda entry: entry[0], reverse=True)
+
+        for score, index in chunk_ranked[:top_k]:
+            item = candidates[index]
+            focused_results.append(
+                RetrievedItem(
+                    chunk_id=item.chunk_id,
+                    document_id=item.document_id,
+                    source_name=item.source_name,
+                    title=item.title,
+                    content=item.content,
+                    score=score,
+                    metadata={
+                        **item.metadata,
+                        "retrieval_channel": "document_focus",
+                        "document_focus_score": score,
+                    },
+                )
+            )
+
+    return focused_results
 
 
 def retrieve(
     query: str,
     *,
     top_k: int = DEFAULT_TOP_K,
+    source_name: str | None = None,
+    top_level_group: str | None = None,
+    hierarchy_scope: str | None = None,
     store: QdrantStore | None = None,
 ) -> list[RetrievedItem]:
     """
-    执行一次基础向量检索。
+    执行本地混合检索。
 
-    当前职责保持尽量单一：
-    - query embedding
-    - 调用向量库搜索
-    - 返回标准化的 RetrievedItem
-
-    当前实现是基础版 retriever，不包含：
-    - query rewrite
-    - hybrid search
-    - reranking
-    - evidence filtering / dedup
-
-    这些能力更适合后续逐步补到 retrieval subgraph，而不是堆在这个入口里。
+    当前 pipeline：
+    - 向量召回
+    - lexical/BM25 召回（显式纳入标题、文件名、路径）
+    - Reciprocal Rank Fusion 融合排序
     """
     cleaned_query = query.strip()
     if not cleaned_query:
@@ -40,27 +351,60 @@ def retrieve(
         raise ValueError("top_k 必须大于 0")
 
     rag_store = store or QdrantStore()
+    vector_top_k = max(top_k * VECTOR_CANDIDATE_MULTIPLIER, top_k)
     query_vector = embed_query(cleaned_query)
-    return rag_store.search(query_vector, top_k=top_k)
+
+    vector_items = rag_store.search(
+        query_vector,
+        top_k=vector_top_k,
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+    )
+
+    bm25_candidates = rag_store.scroll_items(
+        limit=max(vector_top_k, BM25_CANDIDATE_LIMIT),
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+    )
+    bm25_items = _bm25_retrieve(
+        cleaned_query,
+        bm25_candidates,
+        top_k=vector_top_k,
+    )
+    fused_items = _fuse_results(
+        vector_items,
+        bm25_items,
+        top_k=vector_top_k,
+    )
+
+    document_rankings = _rank_documents(cleaned_query, fused_items)
+    focused_items = _document_focused_retrieve(
+        cleaned_query,
+        top_k=vector_top_k,
+        rag_store=rag_store,
+        document_rankings=document_rankings,
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+    )
+
+    if focused_items:
+        return _fuse_results(
+            fused_items,
+            focused_items,
+            top_k=top_k,
+        )
+
+    return fused_items[:top_k]
 
 
 def items_to_docs(items: list[RetrievedItem]) -> list[str]:
-    """
-    将检索结果转换为 responder 友好的纯文本列表。
-
-    当前 responder 仍然消费简单的字符串列表，所以保留这个轻量适配层。
-    如果后续 responder 升级为直接读取结构化 evidence，这里可以弱化甚至移除。
-    """
     return [item.content for item in items if item.content.strip()]
 
 
 def items_to_sources(items: list[RetrievedItem]) -> list[str]:
-    """
-    提取检索来源标识。
-
-    当前默认使用 chunk_id，因为它在现有索引策略下稳定且可定位。
-    后续如果希望上层展示 document 级来源，可以切换成 document_id/title。
-    """
     return [item.chunk_id for item in items if item.chunk_id.strip()]
 
 
@@ -69,12 +413,6 @@ def items_to_evidence(
     *,
     query: str | None = None,
 ) -> list[dict[str, Any]]:
-    """
-    将 RetrievedItem 转换为 agent 层可消费的 evidence 结构。
-
-    这里故意返回通用 dict，而不是直接依赖 agent 模块类型，
-    目的是保持 rag 层与 agent 层解耦，避免未来出现反向依赖。
-    """
     evidence: list[dict[str, Any]] = []
 
     for rank, item in enumerate(items, start=1):
@@ -104,23 +442,17 @@ def retrieve_as_context(
     query: str,
     *,
     top_k: int = DEFAULT_TOP_K,
+    source_name: str | None = None,
+    top_level_group: str | None = None,
+    hierarchy_scope: str | None = None,
     store: QdrantStore | None = None,
 ) -> dict[str, Any]:
-    """
-    为 agent 节点提供一站式检索结果组装。
-
-    返回字段与当前 AgentState 的消费方式对齐：
-    - retrieved_items: 原始结构化结果
-    - retrieved_docs: 文本片段列表
-    - retrieved_sources: 来源标识列表
-    - evidence: 结构化证据
-
-    这是一个面向当前项目状态的薄封装。
-    后续如果 retrieval subgraph 变复杂，可以让 agent 改为直接消费更细的中间结果。
-    """
     items = retrieve(
         query,
         top_k=top_k,
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
         store=store,
     )
 

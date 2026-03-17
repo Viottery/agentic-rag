@@ -9,6 +9,7 @@ from app.agent.nodes import (
     planner,
     query_refiner,
     rag_agent,
+    rag_router,
     search_agent,
     verifier,
 )
@@ -41,7 +42,7 @@ def route_after_query_refiner(state: AgentState) -> str:
     task_type = state["current_task"].get("task_type", "")
 
     if task_type == "rag":
-        return "rag_agent"
+        return "rag_router"
     if task_type == "search":
         return "search_agent"
     return "planner"
@@ -59,7 +60,7 @@ def build_graph():
 
     当前链路：
         planner
-          ├─ dispatcher -> query_refiner -> rag_agent    -> planner
+          ├─ dispatcher -> query_refiner -> rag_router -> rag_agent    -> planner
           ├─ dispatcher -> query_refiner -> search_agent -> planner
           ├─ dispatcher -> action_agent -> planner
           ├─ answer_generator -> citation_mapper -> verifier -> checker -> END
@@ -70,6 +71,7 @@ def build_graph():
     graph.add_node("planner", planner)
     graph.add_node("dispatcher", dispatcher)
     graph.add_node("query_refiner", query_refiner)
+    graph.add_node("rag_router", rag_router)
     graph.add_node("rag_agent", rag_agent)
     graph.add_node("search_agent", search_agent)
     graph.add_node("action_agent", action_agent)
@@ -104,12 +106,13 @@ def build_graph():
         "query_refiner",
         route_after_query_refiner,
         {
-            "rag_agent": "rag_agent",
+            "rag_router": "rag_router",
             "search_agent": "search_agent",
             "planner": "planner",
         },
     )
 
+    graph.add_edge("rag_router", "rag_agent")
     graph.add_edge("rag_agent", "planner")
     graph.add_edge("search_agent", "planner")
     graph.add_edge("action_agent", "planner")

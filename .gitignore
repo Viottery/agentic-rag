@@ -32,3 +32,8 @@ htmlcov/
 
 # Bytecode
 *.pyc
+
+# Generated knowledge-base artifacts
+data/raw/prts-wiki/
+data/raw/**/_manifest.json
+data/raw/**/_index_manifest.json

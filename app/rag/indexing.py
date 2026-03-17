@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,142 @@ from app.rag.schemas import DocumentChunk
 DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 100
 DEFAULT_BATCH_SIZE = 64
+INDEX_MANIFEST_FILE_NAME = "_index_manifest.json"
+
+
+def _emit_progress(enabled: bool, message: str) -> None:
+    if not enabled:
+        return
+    print(message, file=sys.stderr, flush=True)
+
+
+def _build_progress_bar(current: int, total: int, width: int = 24) -> str:
+    if total <= 0:
+        return "[unknown]"
+    ratio = min(max(current / total, 0.0), 1.0)
+    filled = int(width * ratio)
+    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+
+def _emit_progress_bar(enabled: bool, prefix: str, current: int, total: int) -> None:
+    if not enabled:
+        return
+    bar = _build_progress_bar(current, total)
+    print(f"\r{prefix} {bar} {current}/{total}", end="", file=sys.stderr, flush=True)
+    if current >= total:
+        print(file=sys.stderr, flush=True)
+
+
+def _path_to_posix(path: Path) -> str:
+    return path.as_posix()
+
+
+def sha256_file(path: str | Path) -> str:
+    file_path = Path(path)
+    digest = hashlib.sha256()
+    with file_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(8192), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_index_manifest(root_dir: str | Path) -> dict[str, Any]:
+    manifest_path = Path(root_dir) / INDEX_MANIFEST_FILE_NAME
+    if not manifest_path.exists():
+        return {}
+    return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+
+def save_index_manifest(root_dir: str | Path, payload: dict[str, Any]) -> str:
+    manifest_path = Path(root_dir) / INDEX_MANIFEST_FILE_NAME
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return str(manifest_path)
+
+
+def load_source_manifest(root_dir: str | Path) -> dict[str, dict[str, Any]]:
+    source_manifest_path = Path(root_dir) / "_manifest.json"
+    if not source_manifest_path.exists():
+        return {}
+
+    payload = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    result: dict[str, dict[str, Any]] = {}
+    for item in payload.get("pages", []):
+        relative_path = str(item.get("relative_path", "")).strip()
+        if relative_path:
+            result[relative_path] = item
+    return result
+
+
+def build_file_hierarchy_metadata(
+    file_path: str | Path,
+    *,
+    root_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    根据本地文件路径构建层次化 metadata。
+
+    目标：
+    - 让文件系统中的目录树可以稳定映射到向量库 payload
+    - 为后续 coarse-to-fine routing 提供直接可消费的结构字段
+    """
+    path_obj = Path(file_path)
+    if root_dir is not None:
+        root_path = Path(root_dir)
+        relative_path = path_obj.relative_to(root_path)
+        root_name = root_path.name
+    else:
+        relative_path = Path(path_obj.name)
+        root_name = path_obj.parent.name
+
+    path_segments = list(relative_path.parent.parts) if relative_path.parent != Path(".") else []
+    hierarchy_path = "/".join(path_segments)
+    hierarchy_prefixes = [
+        "/".join(path_segments[:index])
+        for index in range(1, len(path_segments) + 1)
+    ]
+
+    return {
+        "file_path": str(path_obj),
+        "source_root": root_name,
+        "relative_path": _path_to_posix(relative_path),
+        "file_name": path_obj.name,
+        "file_stem": path_obj.stem,
+        "knowledge_path": path_segments,
+        "knowledge_path_text": " / ".join(path_segments),
+        "path_segments": path_segments,
+        "hierarchy_path": hierarchy_path,
+        "hierarchy_level": len(path_segments),
+        "hierarchy_prefixes": hierarchy_prefixes,
+        "root_group": path_segments[0] if path_segments else "",
+        "leaf_group": path_segments[-1] if path_segments else "",
+        "top_level_group": path_segments[0] if path_segments else "",
+        "parent_path": "/".join(path_segments[:-1]) if len(path_segments) > 1 else "",
+    }
+
+
+def build_document_id_from_path(
+    file_path: str | Path,
+    *,
+    root_dir: str | Path | None = None,
+) -> str:
+    """
+    使用相对路径生成更稳定的 document_id。
+
+    相比只用 file stem：
+    - 可避免不同目录下同名文件冲突
+    - 更适合层次化知识库重建
+    """
+    path_obj = Path(file_path)
+    if root_dir is not None:
+        relative_path = path_obj.relative_to(Path(root_dir))
+    else:
+        relative_path = Path(path_obj.name)
+
+    normalized = relative_path.with_suffix("").as_posix()
+    return normalized.replace("/", "::")
 
 
 def normalize_text(text: str) -> str:
@@ -175,6 +314,8 @@ def index_chunks(
     *,
     store: QdrantStore | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    progress: bool = False,
+    progress_prefix: str = "[index-chunks]",
 ) -> int:
     """
     将 chunk 批量 embedding 后写入 Qdrant。
@@ -195,6 +336,12 @@ def index_chunks(
         end = min(start + batch_size, total)
         batch_chunks = chunks[start:end]
         batch_texts = [chunk.content for chunk in batch_chunks]
+        _emit_progress_bar(
+            progress,
+            progress_prefix,
+            batch_index + 1,
+            num_batches,
+        )
 
         # 当前采用串行批处理：
         # - 实现简单，失败边界清晰
@@ -218,6 +365,7 @@ def index_document(
     batch_size: int = DEFAULT_BATCH_SIZE,
     recreate: bool = True,
     store: QdrantStore | None = None,
+    progress: bool = False,
 ) -> list[DocumentChunk]:
     """
     完成单篇文档的切块、向量化与入库。
@@ -246,6 +394,8 @@ def index_document(
         chunks,
         store=rag_store,
         batch_size=batch_size,
+        progress=progress,
+        progress_prefix=f"[index-document] upsert {title}",
     )
     return chunks
 
@@ -265,11 +415,13 @@ def index_text_file(
     document_id: str | None = None,
     title: str | None = None,
     metadata: dict[str, Any] | None = None,
+    root_dir: str | Path | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     batch_size: int = DEFAULT_BATCH_SIZE,
     recreate: bool = True,
     store: QdrantStore | None = None,
+    progress: bool = False,
 ) -> list[DocumentChunk]:
     """
     将单个文本文件索引进 Qdrant。
@@ -277,10 +429,18 @@ def index_text_file(
     file_path = Path(path)
     text = load_text_file(file_path)
 
-    resolved_document_id = document_id or file_path.stem
+    hierarchy_metadata = build_file_hierarchy_metadata(
+        file_path,
+        root_dir=root_dir,
+    )
+
+    resolved_document_id = document_id or build_document_id_from_path(
+        file_path,
+        root_dir=root_dir,
+    )
     resolved_title = title or file_path.name
     resolved_metadata = {
-        "file_path": str(file_path),
+        **hierarchy_metadata,
         **(metadata or {}),
     }
 
@@ -295,6 +455,7 @@ def index_text_file(
         batch_size=batch_size,
         recreate=recreate,
         store=store,
+        progress=progress,
     )
 
 
@@ -308,6 +469,7 @@ def index_directory(
     batch_size: int = DEFAULT_BATCH_SIZE,
     recreate: bool = True,
     store: QdrantStore | None = None,
+    progress: bool = False,
 ) -> dict[str, int]:
     """
     批量索引目录下的文本文件。
@@ -321,25 +483,131 @@ def index_directory(
     # 而是改成独立 loader/parser 层，再统一产出 text + metadata。
     files = sorted(path for path in dir_path.glob(pattern) if path.is_file())
     rag_store = store or QdrantStore()
+    existing_index_manifest = load_index_manifest(dir_path)
+    previous_documents = existing_index_manifest.get("documents", {})
+    source_manifest = load_source_manifest(dir_path)
 
     indexed_documents = 0
     indexed_chunks = 0
+    skipped_documents = 0
+    deleted_documents = 0
+    current_documents: dict[str, Any] = {}
+    total_files = len(files)
 
-    for file_path in files:
+    _emit_progress(progress, f"[index-dir] start files={total_files} root={dir_path}")
+
+    for file_index, file_path in enumerate(files, start=1):
+        _emit_progress_bar(
+            progress,
+            "[index-dir] files",
+            file_index,
+            total_files,
+        )
+        relative_path = _path_to_posix(file_path.relative_to(dir_path))
+        content_hash = sha256_file(file_path)
+        source_item = source_manifest.get(relative_path, {})
+        resolved_document_id = str(
+            source_item.get("document_id")
+            or build_document_id_from_path(file_path, root_dir=dir_path)
+        )
+        resolved_title = str(source_item.get("title") or file_path.name)
+        resolved_metadata = {
+            **(source_item or {}),
+        }
+
+        previous_record = previous_documents.get(relative_path, {})
+        if (
+            previous_record
+            and previous_record.get("content_hash") == content_hash
+            and previous_record.get("document_id") == resolved_document_id
+        ):
+            skipped_documents += 1
+            current_documents[relative_path] = previous_record
+            _emit_progress(
+                progress,
+                f"[index-dir] skip unchanged file={relative_path}",
+            )
+            continue
+
+        _emit_progress(
+            progress,
+            f"[index-dir] indexing file={relative_path}",
+        )
         chunks = index_text_file(
             file_path,
             source_name=source_name,
+            document_id=resolved_document_id,
+            title=resolved_title,
+            metadata=resolved_metadata,
+            root_dir=dir_path,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             batch_size=batch_size,
             recreate=recreate,
             store=rag_store,
+            progress=progress,
         )
         if chunks:
             indexed_documents += 1
             indexed_chunks += len(chunks)
+            current_documents[relative_path] = {
+                "document_id": resolved_document_id,
+                "title": resolved_title,
+                "content_hash": content_hash,
+                "chunk_count": len(chunks),
+            }
+        else:
+            current_documents[relative_path] = {
+                "document_id": resolved_document_id,
+                "title": resolved_title,
+                "content_hash": content_hash,
+                "chunk_count": 0,
+            }
 
-    return {
+    current_document_ids = {
+        str(item.get("document_id", "")).strip()
+        for item in current_documents.values()
+        if str(item.get("document_id", "")).strip()
+    }
+
+    for relative_path, previous_record in previous_documents.items():
+        if relative_path in current_documents:
+            continue
+        document_id = str(previous_record.get("document_id", "")).strip()
+        if document_id:
+            if document_id in current_document_ids:
+                continue
+            rag_store.delete_by_document_id(document_id)
+            deleted_documents += 1
+            _emit_progress(
+                progress,
+                f"[index-dir] deleted stale document_id={document_id}",
+            )
+
+    manifest_path = save_index_manifest(
+        dir_path,
+        {
+            "root_dir": str(dir_path),
+            "source_name": source_name,
+            "documents": current_documents,
+        },
+    )
+
+    result = {
         "documents": indexed_documents,
         "chunks": indexed_chunks,
+        "skipped_documents": skipped_documents,
+        "deleted_documents": deleted_documents,
+        "manifest_path": manifest_path,
     }
+    _emit_progress(
+        progress,
+        (
+            "[index-dir] done "
+            f"indexed_documents={indexed_documents} "
+            f"indexed_chunks={indexed_chunks} "
+            f"skipped_documents={skipped_documents} "
+            f"deleted_documents={deleted_documents}"
+        ),
+    )
+    return result

@@ -52,6 +52,10 @@ class SubTask(TypedDict, total=False):
     rewritten_query: str
     sub_queries: List[str]
     rewrite_reason: str
+    routed_source_name: str
+    routed_top_level_group: str
+    routed_hierarchy_scope: str
+    route_reason: str
 
 
 class PlannerControl(TypedDict, total=False):
@@ -107,6 +111,7 @@ class AgentState(TypedDict):
     intermediate_steps: List[AgentStep]
 
     # aggregated execution context
+    kb_structure_summary: str
     aggregated_context: str
     evidence: List[EvidenceItem]
     retrieved_docs: List[str]

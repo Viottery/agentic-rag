@@ -47,6 +47,7 @@ def chat(req: ChatRequest) -> dict:
         "intermediate_steps": [],
 
         # aggregated execution context
+        "kb_structure_summary": "",
         "aggregated_context": "",
         "evidence": [],
         "retrieved_docs": [],

@@ -74,3 +74,24 @@ class SearchResultSelection(BaseModel):
         default="",
         description="简短说明为什么这些结果更值得抽取",
     )
+
+
+class RAGRoutePlan(BaseModel):
+    """本地 RAG 路由结果。"""
+
+    source_name: str = Field(
+        default="",
+        description="优先命中的知识源名称；不确定时可留空",
+    )
+    top_level_group: str = Field(
+        default="",
+        description="优先检索的顶层分组；不确定时可留空",
+    )
+    hierarchy_scope: str = Field(
+        default="",
+        description="更细的层级范围；不确定时可留空",
+    )
+    rationale: str = Field(
+        default="",
+        description="简短说明为什么这样选择检索范围",
+    )

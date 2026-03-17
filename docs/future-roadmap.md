@@ -116,6 +116,58 @@ user question
 
 这样做的目标不是把 pipeline 变复杂，而是减少“单一相似度搜索一把梭”的不稳定性。
 
+这里需要特别区分两类“重排序”：
+
+- 召回融合后的规则化/算法化排序
+  - 例如向量召回、BM25 召回、标题命中、路径命中、RRF 融合、document-focused 二次筛选
+  - 这类排序可以显著提升“找对文档”的稳定性
+- 真正的 query-document semantic reranking
+  - 输入是“用户问题 + 候选文档/候选 chunk”
+  - 输出是一个直接表示二者语义相关性的分数
+  - 常见实现形态是 cross-encoder 或专门的 reranker model
+
+后者应当被视为本地 RAG 近期规划中的重要增强方向，而不是可有可无的优化项。  
+原因在于：
+
+- 多路召回更擅长“把可能相关的内容召回上来”
+- 真正的 semantic reranker 更擅长“从这些候选里挑出最适合回答当前问题的段落”
+
+对于实体型问题、人物介绍类问题、背景说明类问题，这种差异尤为明显。  
+系统可能已经成功命中了正确 document，但如果没有 query-document semantic reranking，仍然会在该 document 内选中不适合回答问题的 chunk。
+
+因此，本地 RAG 更完整的目标形态应理解为：
+
+```text
+question
+  -> route to knowledge scope
+  -> multi-recall inside selected scope
+  -> candidate fusion
+  -> document-level rerank
+  -> chunk-level semantic rerank
+  -> evidence selection
+  -> answer
+```
+
+这里的 `chunk-level semantic rerank` 指的是传统意义上的“同时考虑用户问题与候选文本语义相关性”的重排序，而不是仅靠标题匹配、词项匹配或召回通道融合。
+
+#### 当前边界说明
+
+当前实现可以逐步具备：
+
+- 向量召回
+- BM25/lexical 召回
+- 标题与路径参与候选排序
+- 召回结果融合
+- document-focused 二次筛选
+
+但这仍然不等同于“已经具备真正的 semantic reranker”。  
+在文档、设计和评估中应明确区分：
+
+- `hybrid retrieval / fusion ranking`
+- `query-document semantic reranking`
+
+前者已经是当前演化方向的一部分，后者仍应作为后续设计目标继续推进。
+
 更具体地说，近期本地 RAG 应逐步形成这样的处理顺序：
 
 ```text

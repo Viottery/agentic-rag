@@ -218,6 +218,57 @@ Index local files:
 docker compose exec app python -m app.rag.cli index-dir data/raw
 ```
 
+Crawl a simple MediaWiki knowledge source into local raw documents:
+
+```bash
+docker compose exec app python -m app.rag.cli crawl-mediawiki \
+  "https://prts.wiki/api.php" \
+  data/raw/prts-wiki \
+  --source-name prts_wiki
+```
+
+If the wiki has a meaningful category tree, you can also crawl it into a matching local directory hierarchy:
+
+```bash
+docker compose exec app python -m app.rag.cli crawl-mediawiki \
+  "https://prts.wiki/api.php" \
+  data/raw/prts-wiki \
+  --root-category 干员 \
+  --root-category 敌人 \
+  --max-depth 3 \
+  --source-name prts_wiki
+```
+
+That tree mode writes pages under category-path folders instead of a single flat directory. Repeat `--root-category` to crawl multiple top-level directories.
+
+For sites like PRTS Wiki, you can also approximate `特殊:页面分类` through the MediaWiki category APIs:
+
+```bash
+docker compose exec app python -m app.rag.cli crawl-mediawiki \
+  "https://prts.wiki/api.php" \
+  data/raw/prts-wiki \
+  --all-categories-tree \
+  --max-depth 3 \
+  --source-name prts_wiki
+```
+
+Notes:
+
+- `--limit` is now optional; omit it to remove the hard page cap
+- `--all-categories-tree` is the closest current mode to a full category-directory crawl
+- `--root-category` can be repeated, which is useful for focused wiki demos such as `干员` + `敌人`
+- `首页` is the main page title on PRTS, but full knowledge crawling is better driven by MediaWiki APIs than by recursively scraping homepage links
+
+Or crawl and index in one step:
+
+```bash
+docker compose exec app python -m app.rag.cli crawl-mediawiki \
+  "https://prts.wiki/api.php" \
+  data/raw/prts-wiki \
+  --source-name prts_wiki \
+  --index
+```
+
 Check Qdrant:
 
 ```bash
@@ -254,6 +305,7 @@ These tests currently validate:
 - `search` flow
 - `action` mock flow
 - response shape
+- mediawiki text normalization helpers
 - completion status
 - subtask type routing
 
@@ -261,6 +313,8 @@ These tests currently validate:
 
 - If you update source documents under `data/raw`, rerun the indexing command.
 - The raw documents are not indexed automatically on startup.
+- `crawl-mediawiki` is the current minimal knowledge-ingestion demo path for wiki-style sources such as PRTS Wiki.
+- `crawl-mediawiki --root-category ...` enables a simple category-tree crawl so local files can mirror wiki knowledge structure.
 - `search_agent` already supports real Tavily search, but tests should still treat search quality as heuristic rather than fully production-hardened.
 - `action_agent` is still mocked, so prompts and tests should avoid pretending it is a real external executor.
 - The current system is intentionally explicit about intermediate state so planner/checker behavior can be debugged before the workflow is slimmed down.
