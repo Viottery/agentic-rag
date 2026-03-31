@@ -1,87 +1,87 @@
 # Agentic-RAG
 
-Agentic-RAG is a learning-oriented backend project for exploring how a simple LLM app can evolve into a planner-driven agent system with retrieval, tool delegation, answer synthesis, and guarded fallback behavior.
+Agentic-RAG is a learning-oriented backend project for evolving a simple RAG demo into a skill-oriented agent runtime with fast-path answering, planner-driven task decomposition, local retrieval, tool execution, and grounding validation.
 
 ## Project Goal
 
 The project currently focuses on four things:
 
 - FastAPI as the API surface
-- LangGraph as the workflow orchestrator
+- LangGraph as the runtime orchestrator
 - Qdrant-backed local RAG and Tavily-backed online search as the first real information abilities
-- A supervisor-style planning loop that can decompose work, route to the right capability, and degrade gracefully under runtime limits
+- A fast-path + planner-loop architecture that keeps simple questions short and complex tasks structured
 
-The next practical goal is not to hardcode more and more fixed workflows, but to make retrieval and tool use more structured so the agent can plan its own path through a stable capability graph.
+The next practical goal is not to hardcode more and more fixed workflows, but to package retrieval and tools into stable skills so the planner can reason over a smaller, cleaner action space.
 
 In the near term, this means:
 
-- making local RAG hierarchical, route-aware, and eventually multi-recall + rerank
-- treating online search as a fallback or explicit search path with a more mature retrieval pipeline
-- using LangGraph fan-out / fan-in to parallelize complex retrieval and search tasks
-- keeping grounded answers, citations, and verification as hard constraints
+- turning local RAG into a single callable skill with routing, recall, and rerank hidden behind one interface
+- adding a fast path so simple questions can return directly without entering the planner loop
+- restructuring the agent around `planner -> atomic subtasks -> skill execution -> planner feedback`
+- upgrading validation from lightweight citation checks into grounding validation over tool results and answers
 
 In the longer term, this means evolving the system from an "agentic RAG demo" into a more complete agent runtime that can search, read and edit files, run code, call tools, build knowledge bases, and iteratively solve complex tasks.
 
-## Current Workflow
+## Target Runtime
 
-The current agent is no longer a single-step router. It is a serial supervisor workflow that provides a capability skeleton rather than a hardcoded business workflow:
+The system is being refactored from a serial supervisor workflow into a two-path runtime:
 
 ```text
 user input
+  -> fast gate
+  -> direct answer
+
+user input
+  -> fast gate
   -> planner
-  -> dispatcher
-  -> query_refiner
-  -> rag_agent / search_agent / action_agent
+  -> subtask decomposition
+  -> skill executor(s)
+  -> structured results
   -> planner
-  -> answer_generator
-  -> citation_mapper
-  -> verifier
-  -> checker
+  -> validator
+  -> answer synthesizer
+  -> validator
   -> END or back to planner
 ```
 
-Current execution characteristics:
+Current design characteristics:
 
-- `planner` decomposes the problem into `subtasks`
-- `dispatcher` chooses the current task and routes by `task_type`
-- `query_refiner` rewrites and optionally decomposes search / retrieval queries while trying to preserve the user's language and avoid over-splitting
-- `rag_agent` is real and reads from the local knowledge base
-- `search_agent` can use Tavily when configured, otherwise falls back to mock search; for real search it now does a lightweight web-RAG pass: search, extract, chunk, rerank
-- `action_agent` is still mock, but remains as the future execution boundary
-- `answer_generator` writes an answer draft from compacted task context
-- `citation_mapper` maps answer paragraphs to evidence and attaches source labels, preferring task-local evidence before global fallback
-- `verifier` performs lightweight citation coverage and unsupported-section checks
-- `checker` decides whether the draft can be returned
+- `fast gate` decides whether the request can return directly, should use a single skill, or must enter the planner loop
+- `planner` only performs global task decomposition, executor selection, and missing-information decisions
+- `skill executor` handles atomic tasks with minimal local decision-making
+- `local_kb_retrieve` is becoming the main local RAG skill, encapsulating routing, hybrid recall, and reranking
+- `validator` is being repositioned as a grounding component that checks result-answer alignment and reduces hallucination
+- simple questions should avoid the multi-step planner loop whenever possible
 
 Important design note:
 
-- the graph defines reusable node roles and safety boundaries
-- it does not try to enumerate every future task workflow in advance
-- except for explicitly engineered pipelines such as knowledge-base ingestion, future complex task workflows are expected to be planned by the agent itself on top of this capability graph
+- the runtime should expose stable skills rather than many low-level node roles
+- the planner should reason over a smaller set of structured capabilities
+- future complex workflows should emerge from planning over skills, not from endless fixed graph branches
 
 More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md).
 
 ## Docs
 
-- [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): current LangGraph workflow, state design, degradation strategy, and known limitations
-- [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): near-term RAG implementation direction and long-term agent system design targets
+- [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): target runtime architecture, fast/normal paths, planner boundary, skill runtime, and validator role
+- [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): staged migration plan for fast gate, skill abstraction, local RAG packaging, reranker, and validation
 
-## Runtime Degradation Strategy
+## Runtime Strategy
 
-The workflow is intentionally bounded so it does not loop forever or burn excessive model calls.
+The runtime is intentionally bounded so it does not loop forever or burn excessive model calls.
 
 Two runtime limits are enforced:
 
 - `AGENT_MAX_ITERATIONS`
 - `AGENT_MAX_DURATION_SECONDS`
 
-When the planner wants to continue dispatching but one of these limits has already been reached:
+When the planner loop wants to continue but one of these limits has already been reached:
 
-1. The workflow stops creating new work.
-2. It is forced into `answer_generator`.
-3. The answer draft is prefixed with a clear limitation notice.
-4. `citation_mapper` and `verifier` still run so the result keeps grounding metadata.
-5. `checker` marks the result as a forced budget pass and returns the best-effort answer.
+1. The runtime stops creating new work.
+2. It is forced into answer synthesis.
+3. The answer is prefixed with a clear limitation notice.
+4. Validation still runs so the result keeps grounding metadata.
+5. The system returns the best-effort answer rather than spinning.
 
 This gives the system a predictable fallback:
 
@@ -93,9 +93,9 @@ This is a deliberate tradeoff. It favors bounded execution and observability ove
 
 ## State Design
 
-The `/chat` endpoint currently returns the full `AgentState` because the project is still in workflow-validation mode.
+The `/chat` endpoint currently returns a verbose state because the project is still in architecture-transition mode.
 
-Important top-level fields include:
+Important top-level fields today include:
 
 - `subtasks`
 - `planner_control`
@@ -114,7 +114,18 @@ Important top-level fields include:
 - `answer`
 - `status`
 
-Important subtask fields include:
+The next state shape is expected to move toward:
+
+- `fast_path_decision`
+- `planner_state`
+- `subtasks`
+- `skill_results`
+- `evidence`
+- `answer`
+- `validation`
+- `trace`
+
+Important subtask fields today include:
 
 - `task_id`
 - `task_type`
@@ -127,31 +138,28 @@ Important subtask fields include:
 
 Current design tradeoff:
 
-- It is more verbose than a production state model.
-- That is intentional for now because it makes planning loops, mock boundaries, and fallback behavior easier to inspect.
-- Later, some global derived fields can be slimmed down once behavior is stable.
+- It is more verbose than the target runtime model.
+- That is intentional for now because it makes planner loops, skill packaging, and validation behavior easier to inspect.
+- Later, node-shaped fields can be slimmed down in favor of task/skill/result objects.
 
 ## Code Conventions
 
 Current repository conventions for this phase are:
 
-- Keep the workflow explicit and debuggable rather than prematurely minimal.
-- Prefer small helper functions in workflow nodes when the logic is reused or safety-critical.
+- Keep the runtime explicit and debuggable rather than prematurely abstract.
+- Prefer packaging reusable retrieval or tool logic as skills instead of spreading it across planner prompts.
 - Use short docstrings and comments to explain orchestration intent, fallback behavior, or non-obvious trust constraints.
 - Treat search results, retrieved snippets, and generated drafts as untrusted data inside prompts.
-- Prefer conservative grounding: it is acceptable for citation coverage to be stricter if that prevents weak evidence from being attached to the answer.
+- Prefer conservative grounding: it is acceptable for validation to be stricter if that prevents weak evidence from being attached to the answer.
 
 ## Current Limitations
 
-- `search_agent` can perform real Tavily search when configured, but deeper result filtering, extraction, and validation are still basic.
-- `action_agent` is still mock and does not perform real external actions.
-- Local retrieval is still baseline vector search rather than hierarchical routing with multi-recall and reranking over structured knowledge domains.
-- Citation mapping and verification are currently lightweight heuristic checks, not full claim-level factual verification.
-- Query rewriting is intentionally conservative now, but it is still heuristic rather than retrieval-policy-aware.
-- `aggregated_context` and some global fields duplicate information that also exists inside `subtasks`.
-- The workflow is serial today; the dispatcher is structured for future parallel expansion, but retrieval/search-level fan-out/fan-in is not implemented yet.
-- The checker currently distinguishes quality pass vs budget-forced pass, but deeper failure taxonomy is still basic.
-- Tool use is still at an early stage; the current graph has an execution boundary, but not yet a general-purpose agent runtime comparable to coding agents or desktop agent assistants.
+- The codebase still contains older node-oriented workflow structure and has not fully migrated to the new skill runtime.
+- `local_kb_retrieve` is still being packaged; some RAG logic remains spread across planner-facing nodes.
+- The fast path gate is not fully implemented yet.
+- Validation is still lighter than the target grounding-validator design.
+- Tool execution is still at an early stage and has not yet converged on the same skill contract as local retrieval.
+- Parent-child indexing remains a TODO rather than an active delivery item.
 
 ## Project Structure
 
@@ -161,7 +169,7 @@ agentic-rag/
 │   ├── agent/       # LangGraph workflow, nodes, prompts, state, schemas
 │   ├── api/         # FastAPI routes and schemas
 │   ├── core/        # configuration
-│   ├── rag/         # indexing, embeddings, qdrant store, retriever, cli
+│   ├── rag/         # indexing, embeddings, qdrant store, retriever, reranker, cli
 │   └── tools/       # future external tools
 ├── data/
 │   └── raw/         # source documents for indexing
@@ -357,7 +365,7 @@ These tests currently validate:
 - response shape
 - mediawiki text normalization helpers
 - completion status
-- subtask type routing
+- subtask execution routing
 
 ## Development Notes
 
@@ -367,7 +375,7 @@ These tests currently validate:
 - `crawl-mediawiki --root-category ...` enables a simple category-tree crawl so local files can mirror wiki knowledge structure.
 - `search_agent` already supports real Tavily search, but tests should still treat search quality as heuristic rather than fully production-hardened.
 - `action_agent` is still mocked, so prompts and tests should avoid pretending it is a real external executor.
-- The current system is intentionally explicit about intermediate state so planner/checker behavior can be debugged before the workflow is slimmed down.
+- The current system is intentionally explicit about intermediate state so planner, skill execution, and validation behavior can be debugged before the runtime is slimmed down.
 
 ## License
 

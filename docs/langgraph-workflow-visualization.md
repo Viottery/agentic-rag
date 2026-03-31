@@ -1,14 +1,15 @@
-# LangGraph Agent Flow Visualization
+# Agent Runtime Architecture
 
-本文档描述当前项目中的 supervisor 风格 LangGraph 编排框架，以及它的状态设计、降级策略和当前已知问题。
+本文档描述项目下一阶段的目标架构。
 
-需要特别说明的是：
+这份文档不再把系统理解为一条固定的
+`planner -> dispatcher -> query_refiner -> rag/search -> answer -> checker`
+串行链路，而是改为：
 
-- 这张图描述的是当前系统的能力骨架与控制边界
-- 它不是对未来所有任务都写死的业务 workflow
-- 当前 graph 提供的是可复用节点角色、预算控制、可信回答链路和工具边界
-- 更复杂的任务流程应尽量由 agent 在图上规划出来，而不是通过不断硬编码专用分支来实现
-- 显式例外是知识库构建、索引刷新这类高副作用或长时任务，它们更适合作为独立工程化子流程
+- `fast path` 优先处理简单问题
+- `planner loop` 处理复杂任务
+- `skill executor` 负责单一职责执行
+- `validator` 负责结果与答案的关联性、可解释性和幻觉抑制
 
 ## 1. 总入口
 
@@ -16,546 +17,260 @@
 Client
   -> POST /chat
   -> FastAPI route
-  -> build initial AgentState
-  -> LangGraph agent_graph
-  -> return final AgentState
+  -> build initial state
+  -> fast path gate
+  -> direct answer or planner loop
+  -> return final response
 ```
 
-对应代码：
+对应代码入口仍然是：
 
 - `app/api/routes/chat.py`
 - `app/agent/graph.py`
 
-## 2. 当前主流程
+但 graph 的职责将从“固定节点编排”逐步转向“runtime orchestration”。
 
-```mermaid
-flowchart TD
-    A[planner] --> B{planner_control.decision}
-    B -->|dispatch| C[dispatcher]
-    B -->|answer| G[answer_generator]
-    B -->|finish| Z[END]
+## 2. 新的主流程
 
-    C --> D{current_task.task_type}
-    D -->|rag/search| QR[query_refiner]
-    D -->|action| H[action_agent]
-    QR --> E{task_type}
-    E -->|rag| F[rag_agent]
-    E -->|search| I[search_agent]
+### 2.1 Fast Path
 
-    F --> A
-    I --> A
-    H --> A
+适用目标：
 
-    G --> J[citation_mapper]
-    J --> K[verifier]
-    K --> L[checker]
-    L -->|quality pass| M[END]
-    L -->|quality fail| A
-    L -->|forced budget pass| M
-```
+- 简单问题尽快返回
+- 不需要本地 RAG / 搜索 / 工具
+- 不需要多步决策
+- 不值得进入 planner loop
 
-这条链路表达的是当前默认回答链路：
+目标链路：
 
 ```text
-用户问题
-  -> planner 拆解/选择子任务
-  -> dispatcher 分发
-  -> query_refiner 做 query 重写和拆分
-  -> 子 agent 执行
-  -> 回到 planner 复盘
-  -> answer_generator 生成答案草稿
-  -> citation_mapper 补引用
-  -> verifier 做轻量支持度检查
-  -> checker 审核
-  -> 正常通过则输出
-  -> 未通过则回到 planner
-  -> 若达到预算限制则强制放行最佳努力答案
+user input
+  -> fast gate
+  -> direct answer model
+  -> return
 ```
 
-它适合回答当前大多数“先规划、再检索/搜索、再生成、再验证”的问题，但它不意味着未来所有任务都必须逐节点走完整链路。
+可选保留一个极轻量的 sanity check，但它不应演化成新的重链路。
 
-未来更合理的演化方向是：
+### 2.2 Normal Path
 
-- 简单本地 RAG 问题走更短的 fast path
-- 明确要求联网或本地检索不足时，转入 online search path
-- 复杂工具执行类问题走 tool/runtime path
-- 只有知识库构建、索引维护这类任务，才额外进入独立子流程
-- 复杂 retrieval/search 问题逐步引入 LangGraph 支持的并行 fan-out / fan-in
-
-## 3. Graph 的定位
-
-当前 graph 更适合被理解为一张“能力编排图”，而不是一份“固定任务清单”。
-
-它主要负责四件事：
-
-1. 为 agent 提供稳定的规划、检索、执行、生成、验证边界
-2. 约束高成本节点的调用顺序和预算
-3. 统一 state / evidence / citation 的流转方式
-4. 为后续更复杂的 retrieval routing 和 tool runtime 留出扩展接口
-5. 为 future fan-out / fan-in 并行分支保留清晰的汇合点
-
-这意味着：
-
-- graph 中的节点角色是相对稳定的
-- 但 agent 在节点之间走出的具体 task workflow 可以随着问题类型变化
-- 文档里不应把“某个未来任务一定按某个固定链路执行”写死
-
-## 4. 节点职责
-
-### planner
-
-职责：
-
-- 读取主问题、已有子任务、已汇总上下文、checker 反馈
-- 生成或更新 `subtasks`
-- 决定当前动作：
-  - `dispatch`
-  - `answer`
-  - `finish`
-- 选择当前要执行的 `selected_task_id`
-- 在达到预算限制时，不再继续派发，转入回答生成
-
-设计意图：
-
-- `planner` 决定“现在应该做什么”
-- 但它不应该承载所有检索细节
-- 更细的本地层次化路由、在线搜索策略、工具风险分级，后续应逐步下沉到更专门的节点或 runtime 组件
-
-关键输出：
-
-- `thought`
-- `subtasks`
-- `planner_control`
-- `current_task`
-
-### dispatcher
-
-职责：
-
-- 根据 `planner_control.selected_task_id` 选中子任务
-- 将任务状态标记为 `running`
-- 根据 `task_type` 路由到具体子 agent
-
-当前是串行分发，但接口已经是 task-based，后续可以演进到并行 fan-out / fan-in。
-
-它的定位更偏“任务路由器”，而不是最终的复杂 workflow 引擎。
-
-### query_refiner
-
-职责：
-
-- 对 `rag` / `search` 子任务做 query 重写
-- 对复杂问题生成少量 `sub_queries`
-- 为下游检索与搜索提供更直观、可执行的查询
-
-当前实现特点：
-
-- 使用单次结构化 LLM 输出
-- 优先保持用户原始语种，避免无意义的英文化重写
-- 对简单问题尽量不拆，对复杂问题也只保留少量非重叠 `sub_queries`
-- 不区分“本地检索”和“在线搜索”的高层策略，只统一做信息型任务的 query 优化
-
-后续演化方向：
-
-- 对本地 RAG，配合层次化知识库元数据做粗到细的范围收缩
-- 对本地 RAG，逐步支持多路召回与重排序，而不只是单次向量检索
-- 对在线搜索，更多承担实体约束、问题压缩和搜索意图表达
-- 对简单问题保持克制，减少无意义 rewrite
-
-### rag_agent
-
-职责：
-
-- 执行本地知识库检索
-- 复用 `retrieve_as_context(...)`
-- 回写：
-  - 子任务 `result`
-  - 子任务 `evidence`
-  - 子任务 `sources`
-  - 全局 `retrieved_docs`
-  - 全局 `retrieved_sources`
-  - 全局 `evidence`
-  - `aggregated_context`
-
-特点：
-
-- 这是当前系统里第一个真实可用的子 agent
-- 检索失败时会保守降级为空结果，而不是中断整条链路
-
-当前与未来的差异：
-
-- 当前仍是单层向量检索
-- 近期目标是升级为更结构化的本地 retrieval routing：
-  - 文件夹/知识域层级
-  - Qdrant 中的层次化组织
-  - 每层知识域的元数据描述
-  - 逐层缩小范围后再进入细粒度 chunk 检索
-  - 在选定范围内支持多路召回与重排序
-
-更成熟的目标 pipeline 应更接近：
+复杂问题走统一的 planner loop：
 
 ```text
-route to scope
-  -> multi-recall
+user input
+  -> fast gate
+  -> planner
+  -> subtask decomposition
+  -> skill executor(s)
+  -> structured task results
+  -> planner
+  -> validator
+  -> answer synthesizer
+  -> validator
+  -> END or back to planner
+```
+
+目标不是把所有未来任务都提前写成固定 workflow，
+而是建立一套稳定的 runtime 边界：
+
+- planner 决定“现在做什么”
+- skill executor 决定“如何完成当前原子任务”
+- validator 决定“结果是否真的支撑答案”
+
+## 3. 核心设计原则
+
+### 3.1 简单问题不进大循环
+
+系统应该优先判断：
+
+- 是否可以直接回答
+- 是否只需要一次 skill 调用
+- 是否必须进入 planner loop
+
+建议 fast gate 的最小决策集为：
+
+- `direct_answer`
+- `single_skill`
+- `planner_loop`
+
+这样可以避免简单问题也被迫经历多轮 planner、检索、校验。
+
+### 3.2 Planner 只做全局决策
+
+Planner 的职责应收敛为：
+
+- 识别当前信息缺口
+- 拆分单一职责子任务
+- 选择每个子任务的 executor / skill
+- 根据执行结果决定继续、补任务或进入回答
+
+Planner 不负责：
+
+- 子任务内部 query rewrite 细节
+- 本地检索路由细节
+- rerank 细节
+- 工具参数级微调
+- 最终引用映射细节
+
+一句话说，Planner 决定：
+
+- `what to do`
+- `who should do it`
+- `what is still missing`
+
+而不决定：
+
+- `how exactly to do it`
+
+### 3.3 子任务必须单一职责
+
+子任务设计原则：
+
+- 原子化
+- 可验证
+- 输入输出明确
+- 尽量避免内部再做 planner 式决策
+
+子任务 executor 允许有“局部策略”，但不允许有“全局规划”。
+
+例如：
+
+- `local_kb_retrieve` 内部可以做 query normalize、scope route、hybrid retrieval、rerank
+- 但它不应自己决定“是否改去搜索”或“是否继续拆任务”
+
+这些判断必须回到 Planner。
+
+## 4. Skill Runtime
+
+### 4.1 为什么要用 skill 抽象
+
+系统的核心能力应逐步收敛为 skill，而不是让 planner 直接面向大量底层实现细节。
+
+这样做的价值：
+
+- 降低 planner prompt 的硬编码能力描述
+- 统一本地 RAG、搜索、工具调用的执行协议
+- 让执行结果更容易被 validator 和 planner 消费
+- 后续可平滑扩展更多 executor
+
+### 4.2 当前最重要的 skill
+
+近期最重要的 skill 是：
+
+- `local_kb_retrieve`
+
+它应把当前本地 RAG 的内部流程封装起来：
+
+```text
+query normalize
+  -> hierarchy routing
+  -> scoped hybrid recall
   -> candidate fusion
-  -> rerank
-  -> chunk selection
-  -> evidence
-```
-
-### search_agent
-
-职责：
-
-- 处理信息获取类任务
-- 优先尝试使用 Tavily 执行真实搜索
-- 对少量高质量 URL 做网页抽取
-- 对抽取内容做临时 chunk 化和二次筛选
-- 若未配置 `TAVILY_API_KEY`，回退到 mock 搜索
-- 写回统一 evidence 结构
-
-当前问题：
-
-- 缺少 API key 时仍然是 mock
-- 当前网页抽取与 chunk rerank 仍偏轻量，不是更成熟的标准化 search pipeline
-- 当前结果清洗与来源筛选仍有启发式成分
-
-后续定位：
-
-- 作为本地 RAG 不足时的补充型 retrieval
-- 或作为用户显式要求联网搜索时的主路径
-- 不追求对所有问题都默认联网
-
-更成熟的目标 pipeline 应更接近：
-
-```text
-query planning
-  -> search
-  -> result normalization
-  -> dedup
-  -> extract
-  -> chunk
-  -> rerank
+  -> semantic rerank
   -> evidence selection
+  -> structured result
 ```
 
-设计原则：
+上层只看到：
 
-- 尽量少依赖不断堆叠的人工启发式
-- 优先把质量提升放在 pipeline 设计、排序质量、去重和结构化 evidence 上
+- 输入：任务目标、query、可选 scope hint
+- 输出：summary、evidence、sources、route trace、confidence、failure reason
 
-### action_agent
+而不需要感知内部到底有多少检索步骤。
 
-职责：
+后续可以并列增加：
 
-- 处理执行类任务
-- 当前仍为 mock
-- 写回模拟执行结果
+- `web_search_retrieve`
+- `tool_execute`
+- `file_read`
+- `code_run`
 
-当前问题：
+## 5. Validator 的新定位
 
-- 它不是实际外部动作执行
-- 同样会标记降级信息
+validator 不再只是“引用覆盖率检查器”。
 
-长远定位：
+它更适合作为：
 
-- 这里不会只停留在“单个动作工具”
-- 它更适合作为未来 tool runtime 的执行边界
-- 后续会逐步承接：
-  - 信息获取工具
-  - 本地文件工具
-  - 代码读写与执行工具
-  - 知识库构建工具
-  - 其他多步复杂任务的执行单元
+- `grounding validator`
 
-### answer_generator
+职责包括：
 
-职责：
+- 验证子任务执行结果是否真的满足任务目标
+- 验证最终答案是否被已有结果支持
+- 标记强支持 / 弱支持 / 无支持结论
+- 给 planner 返回下一轮可执行反馈
+- 强化答案的可解释性
+- 尽量消除 hallucination
 
-- 汇总已完成子任务
-- 基于 `aggregated_context + evidence + subtasks` 生成 `answer_draft`
-- 若 planner 已判定达到预算限制，会在答案前附加限制说明
+它关注的不只是“有没有 citation”，而是：
 
-当前原则：
+- 结果和答案是否相关
+- 证据是否足够支撑结论
+- 哪些部分超出了执行结果边界
 
-- 优先生成“有证据约束的回答”
-- 不追求在证据不足时强行完整
+## 6. State 设计方向
 
-### citation_mapper
+下一阶段 state 应逐步围绕这些对象重构：
 
-职责：
-
-- 将 `answer_draft` 按段落拆分
-- 为每个关键段落映射最相关的 evidence
-- 生成 `grounded_answer`
-- 生成结构化 `citations`
-
-当前实现特点：
-
-- 使用轻量规则做段落级引用映射
-- 不额外调用 LLM
-- 优先在对应子任务的 evidence 中找引用，再回退到全局 evidence
-- 会对同段重复引用做去重
-- 优先控制 token 消耗与响应速度
-- 当前策略偏保守，宁可少贴，也不硬贴低相关 chunk
-
-### verifier
-
-职责：
-
-- 检查关键段落是否带引用
-- 计算 `citation_coverage`
-- 标记 `unsupported_claims`
-- 识别是否引用了降级来源
-- 输出 `verification_result`
-
-当前实现特点：
-
-- 是轻量校验，不是完整 claim-level fact checking
-- 目标是先快速过滤掉明显不可信的回答
-
-它当前承担的是“可信底线”，不是最终的完整事实审查器。
-
-### checker
-
-职责：
-
-- 正常情况下检查答案草稿是否足够回答用户问题
-- 输出：
-  - `passed`
-  - `feedback`
-  - `pass_reason`
-
-当前行为分三类：
-
-- `quality_pass`
-- `quality_fail`
-- `forced_budget_pass`
-
-说明：
-
-- `checker` 的主审核逻辑仍保留
-- 但它现在会先消费 `verification_result`
-- 当 verifier 判断引用覆盖不足或存在未支持段落时，会直接打回 planner
-- 只有在预算限制已触发时，才会直接放行当前最佳努力答案
-
-从长期看，`checker` 更像“回答放行控制器”，而不是唯一真理来源。
-
-## 5. 当前状态结构
-
-`AgentState` 已从单轮动作状态升级为任务编排状态。
-
-核心顶层字段：
-
-- `question`
+- `request`
+- `fast_path_decision`
+- `planner_state`
 - `subtasks`
-- `planner_control`
-- `current_task`
-- `aggregated_context`
+- `skill_results`
 - `evidence`
-- `answer_draft`
-- `grounded_answer`
-- `citations`
-- `verification_result`
-- `checker_result`
-- `trace_summary`
-- `started_at`
-- `iteration_count`
-- `max_iterations`
-- `max_duration_seconds`
 - `answer`
-- `status`
+- `validation`
+- `trace`
 
-当前上下文压缩策略：
+相比当前 state，重点变化是：
 
-- `aggregated_context` 优先保留每个已完成子任务的紧凑摘要，而不是原始长结果
-- 传给 `answer_generator` 的 evidence 会截断并去重，避免把整份搜索结果原样塞回模型
-- 真实搜索结果会做轻量排序与截断，优先保留更可信、更贴题的少量结果
+- 降低固定节点痕迹
+- 强化 task / skill / validation 三类结构化对象
+- 让 planner 消费的是“结果对象”，而不是底层节点临时状态
 
-`SubTask` 重点字段：
+## 7. 延迟与成本控制
 
-- `task_id`
-- `task_type`
-- `question`
-- `status`
-- `result`
-- `evidence`
-- `sources`
-- `error`
-- `degraded`
-- `degraded_reason`
-- `rewritten_query`
-- `sub_queries`
-- `rewrite_reason`
+这套架构的直接目标之一，就是缩短简单问题链路并控制复杂问题成本。
 
-`PlannerControl` 重点字段：
+### 7.1 Fast Path 控制成本
 
-- `decision`
-- `selected_task_id`
-- `planner_note`
-- `checker_feedback`
-- `force_answer_reason`
+简单问题直接输出，避免：
 
-`CheckerResult` 重点字段：
+- planner 多轮循环
+- 多次 query rewrite
+- 无必要的检索与 rerank
+- validator 重链路
 
-- `passed`
-- `feedback`
-- `pass_reason`
+### 7.2 Normal Path 控制成本
 
-`VerificationResult` 重点字段：
+复杂任务的优化方向应集中在：
 
-- `needs_revision`
-- `citation_coverage`
-- `confidence`
-- `unsupported_claims`
-- `degraded_citations`
-- `summary`
+- 降低 planner 回合数
+- 让子任务更原子，减少重复工作
+- 让 skill 内部做强执行，而不是频繁回到 planner
+- 控制 reranker 候选规模
+- 仅在真正需要时追加 validator / 补任务
 
-## 6. 当前降级策略
+## 8. 近期迁移路径
 
-当前系统采用“预算驱动的最佳努力回答”。
+建议按以下顺序迁移：
 
-预算维度：
+1. 增加 fast gate，将简单问题从主循环中剥离
+2. 将本地 RAG 封装为 `local_kb_retrieve` skill
+3. 将现有 `rag/search/action` 统一到 skill executor 协议
+4. 重写 planner 输出 schema，改为“子任务 + executor/skill”
+5. 将 verifier / checker 逐步重构为 grounding validator
+6. 逐步减少旧串行 workflow 的硬编码分支
 
-- 思考轮数限制：`max_iterations`
-- 思考时间限制：`max_duration_seconds`
+## 9. 当前明确不优先推进的事项
 
-触发方式：
+- 父子索引 / 多层索引对象建设保留在 TODO
+- 不优先继续扩张旧 graph 上的固定节点链
+- 不优先把复杂性继续堆到 planner prompt 上
 
-- planner 每轮都会检查预算
-- 一旦触发，planner 会改为进入 `answer_generator`
-- `answer_generator` 会把限制原因写进答案草稿
-- `citation_mapper` 与 `verifier` 仍会运行
-- `checker` 看到这是强制回答后，会以 `forced_budget_pass` 放行
+当前优先级更高的是：
 
-这套策略解决的问题：
-
-- 防无限回环
-- 防过量 LLM 调用
-- 在 search/action 仍为 mock 时，避免系统为了“拿不到的真实信息”反复空转
-- 即使进入最佳努力回答，也尽量保留引用与支持度信息
-
-这套策略的代价：
-
-- 它偏向“可控结束”，而不是“尽力搜索到最后一刻”
-- 预算限制目前是 workflow 级，而不是节点级
-
-## 7. RAG 与子 agent 的关系
-
-当前保留了已有的 RAG 能力，`rag_agent` 直接复用检索封装：
-
-```text
-rag_agent
-  -> retrieve_as_context(query)
-     -> embed_query(query)
-     -> QdrantStore.search(...)
-     -> items_to_docs(...)
-     -> items_to_sources(...)
-     -> items_to_evidence(...)
-  -> write result back to subtask and AgentState
-```
-
-对应数据链路：
-
-```mermaid
-flowchart TD
-    A[data/raw/*.txt] --> B[indexing]
-    B --> C[embeddings]
-    C --> D[Qdrant]
-    E[subtask question] --> F[rag_agent]
-    F --> G[retrieve_as_context]
-    G --> D
-    G --> H[evidence / docs / sources]
-    H --> I[aggregated_context]
-    I --> J[answer_generator]
-```
-
-## 8. 当前系统做法与问题拆解
-
-### 现行做法
-
-- 使用 planner 驱动 subtasks
-- 通过 dispatcher 做 task-based 串行分发
-- 将真实能力先落在 RAG
-- 将 search 接成真实 Tavily + 轻量网页抽取能力
-- 将 action 暂时保留为 mock 边界
-- 用 answer_generator + checker 分离生成与验证
-- 用预算限制兜底回环
-
-这套做法的核心价值在于：
-
-- 先把“能力边界”和“可信链路”搭起来
-- 再逐步替换内部实现
-- 而不是先写死大量专用 workflow 再事后清理
-
-### 当前问题
-
-- `search_agent` 已接入真实搜索，但结果标准化、抽取、chunk 化、重排与证据选择仍是第一版实现
-- `query_refiner` 目前只做轻量 query 重写与拆分，还没有更复杂的 local routing / online search policy
-- `action_agent` 不是真实执行器
-- `citation_mapper` 目前是段落级引用映射，不是句级引用
-- `verifier` 目前是轻量检查，不是完整事实核验器
-- `aggregated_context`、全局 `evidence` 与 `subtasks[*].result/evidence` 之间仍有信息重复
-- 预算限制目前是全局的，缺少更细的节点级超时治理
-- `checker` 的失败类型还不够细
-- 并行调度接口已预留，但尚未实现 retrieval/search 级 fan-out / fan-in
-- 本地 RAG 还没有层次化知识域、路由元数据、多路召回和逐层缩小范围的 retrieval subgraph
-- 简单任务还没有稳定 fast path，复杂任务也还没有独立 tool runtime
-
-### 为什么这样做仍然合理
-
-- 当前阶段的重点是验证编排框架，而不是一次性把所有工具接全
-- 真实 RAG + mock 其余能力，是一种成本更低、但依然能验证控制流和状态流转的折中方案
-- 保留较胖的 state，也有利于调试 planner / checker / fallback 的行为
-- 先强调能力边界而不是写死任务流程，更符合后续向复杂 agent 助手演化的方向
-
-## 9. 代码映射
-
-- `app/api/routes/chat.py`
-  - `/chat` 入口
-  - 初始化新版本 `AgentState`
-
-- `app/core/config.py`
-  - 读取 `AGENT_MAX_ITERATIONS`
-  - 读取 `AGENT_MAX_DURATION_SECONDS`
-
-- `app/agent/state.py`
-  - 定义 `AgentState`
-  - 定义 `SubTask`
-  - 定义 `PlannerControl`
-  - 定义 `CheckerResult`
-
-- `app/agent/schemas.py`
-  - 定义 `TaskItem`
-  - 定义 `PlannerDecision`
-  - 定义 `CheckerDecision`
-
-- `app/agent/graph.py`
-  - 定义 supervisor 风格 LangGraph
-  - 负责 planner、dispatcher、各子 agent、citation_mapper、verifier、checker 的基础路由骨架
-
-- `app/agent/nodes.py`
-  - 实现 planner / dispatcher / rag_agent / search_agent / action_agent / answer_generator / citation_mapper / verifier / checker
-
-- `app/rag/retriever.py`
-  - 保留现有知识库检索能力
-  - 是后续分层 local retrieval 的现有起点
-
-## 10. 对后续演化的约束
-
-后续无论新增多少能力，建议继续遵守下面几条原则：
-
-- 不把 graph 文档写成硬编码任务清单
-- 优先描述稳定节点角色、state 契约和能力边界
-- 把知识库构建、索引刷新这类高副作用流程单独工程化
-- 把一般复杂问题的执行路径交给 agent 规划，而不是预先写死所有专用 workflow
-- 让 retrieval、tool use、citation、verification 使用尽量统一的数据契约
-- 尽量减少把系统主干建立在手工启发式上的做法
-- 优先用成熟 pipeline、多路召回、重排序和 fan-out / fan-in 图结构解决复杂问题
-
-## 11. 下一步建议
-
-- 先把本地 RAG 做成更结构化、支持多路召回与重排序的层次化检索系统
-- 再把在线搜索收敛为补充型 retrieval，并向更成熟的 search pipeline 演化
-- 同时逐步把复杂 retrieval/search 任务升级为支持并行 fan-out / fan-in 的图结构
-- 之后再把 `action_agent` 演化为更完整的 tool runtime 与复杂任务执行边界
+- skill 抽象
+- planner loop 重构
+- semantic reranker 落地与调优
+- grounding validator 的职责重构
