@@ -1,0 +1,13 @@
+services:
+  app:
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - /etc/OpenCL/vendors:/etc/OpenCL/vendors:ro
+      - /usr/lib/x86_64-linux-gnu/intel-opencl:/usr/lib/x86_64-linux-gnu/intel-opencl:ro
+      - /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1:/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1:ro
+      - /usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020:/usr/lib/x86_64-linux-gnu/libze_intel_gpu.so.1.14.37020:ro
+    environment:
+      LD_LIBRARY_PATH: /usr/lib/wsl/lib
+      OPENCL_VENDOR_PATH: /etc/OpenCL/vendors

@@ -193,6 +193,7 @@ question
 - 暂时不追求特别复杂的多跳推理型 retrieval graph
 - 暂时不追求把所有 routing 都压给 planner
 - 暂时不追求在一个节点里塞满所有本地检索策略
+- 父子索引 / 多层索引对象建设确定保留在 TODO 中，但不作为当前这轮 reranker 落地的阻塞项
 
 更好的做法是：
 

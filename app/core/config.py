@@ -9,6 +9,13 @@ class Settings(BaseSettings):
     debug: bool = True
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
+    embedding_model: str = "BAAI/bge-base-zh-v1.5"
+    embedding_backend: str = "auto"
+    embedding_device: str = "auto"
+    reranker_enabled: bool = True
+    reranker_model: str = "BAAI/bge-reranker-base"
+    reranker_device: str = "auto"
+    reranker_max_candidates: int = 12
     agent_max_iterations: int = 6
     agent_max_duration_seconds: int = 90
     tavily_api_key: str = ""

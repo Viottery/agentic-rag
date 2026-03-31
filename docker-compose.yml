@@ -28,6 +28,7 @@ services:
       TAVILY_SEARCH_DEPTH: ${TAVILY_SEARCH_DEPTH}
       TAVILY_MAX_RESULTS: ${TAVILY_MAX_RESULTS}
       HF_ENDPOINT: https://hf-mirror.com
+      HF_HUB_DISABLE_XET: "1"
       HF_HOME: /root/.cache/huggingface
       TRANSFORMERS_CACHE: /root/.cache/huggingface/hub
       SENTENCE_TRANSFORMERS_HOME: /root/.cache/sentence_transformers

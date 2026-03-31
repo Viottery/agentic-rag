@@ -14,6 +14,11 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     apt-get update && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
+    clinfo \
+    libdrm-intel1 \
+    libigdgmm12 \
+    libze1 \
+    ocl-icd-libopencl1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt

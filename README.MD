@@ -186,6 +186,13 @@ OPENAI_API_KEY=...
 OPENAI_BASE_URL=...
 OPENAI_MODEL=...
 OPENAI_TEMPERATURE=0
+EMBEDDING_MODEL=BAAI/bge-base-zh-v1.5
+EMBEDDING_BACKEND=auto
+EMBEDDING_DEVICE=auto
+RERANKER_ENABLED=true
+RERANKER_MODEL=BAAI/bge-reranker-base
+RERANKER_DEVICE=auto
+RERANKER_MAX_CANDIDATES=12
 TAVILY_API_KEY=
 TAVILY_SEARCH_DEPTH=basic
 TAVILY_MAX_RESULTS=5
@@ -199,10 +206,53 @@ AGENT_MAX_ITERATIONS=6
 AGENT_MAX_DURATION_SECONDS=90
 ```
 
+Embedding runtime selection:
+
+- `EMBEDDING_BACKEND=auto` will prefer Intel GPU via OpenVINO when available, otherwise fall back to Torch
+- `EMBEDDING_DEVICE=auto` will prefer Intel GPU, then Nvidia CUDA, then CPU
+- explicit override examples:
+  - `EMBEDDING_BACKEND=openvino` + `EMBEDDING_DEVICE=gpu`
+  - `EMBEDDING_BACKEND=torch` + `EMBEDDING_DEVICE=cuda`
+  - `EMBEDDING_BACKEND=torch` + `EMBEDDING_DEVICE=cpu`
+- `resolve_embedding_runtime()` reflects the preferred runtime choice, while `get_embedding_model()` is the final authority because model export / compile may still fail and trigger a fallback
+
 For model download acceleration inside Docker, the project currently uses:
 
 - `HF_ENDPOINT=https://hf-mirror.com`
+- `HF_HUB_DISABLE_XET=1` to prevent `huggingface_hub` from bypassing the mirror through the Xet/CAS download path
 - host-mounted Hugging Face caches via `docker-compose.yml`
+
+## Intel GPU Notes
+
+For the WSL2 + Docker + Intel GPU path used in this repository, the runtime is split into two layers:
+
+- device visibility:
+  - OpenVINO can enumerate `GPU`
+  - `clinfo` can enumerate `Intel(R) OpenCL Graphics`
+- model execution:
+  - some SentenceTransformers models may still fail during OpenVINO GPU export / compile
+  - in `auto` mode, the embedding loader will log the failure reason and fall back to Torch
+
+Recommended verification commands:
+
+```bash
+docker exec agentic-rag-app clinfo | sed -n '1,80p'
+docker exec agentic-rag-app python -c "from openvino import Core; core = Core(); print(core.available_devices); print(core.get_versions('GPU'))"
+docker exec agentic-rag-app python -c "from app.rag.embeddings import resolve_embedding_runtime; print(resolve_embedding_runtime())"
+```
+
+If you want to validate actual model execution rather than only device visibility, test a real encode path:
+
+```bash
+docker exec agentic-rag-app python -c "from app.rag.embeddings import embed_query; vec = embed_query('embedding runtime smoke test'); print(len(vec))"
+```
+
+Current observed behavior on this machine:
+
+- Intel GPU device visibility is working
+- OpenVINO GPU plugin loads successfully
+- some embedding models can still fail at OpenVINO GPU program build time
+- when that happens, the code falls back automatically instead of breaking the RAG pipeline
 
 ## Run Locally
 

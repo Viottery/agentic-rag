@@ -6,4 +6,5 @@ qdrant-client
 pytest
 httpx>=0.27,<1
 langchain-openai
-sentence-transformers
+torch
+sentence-transformers[openvino]

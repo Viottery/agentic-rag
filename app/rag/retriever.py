@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import math
+import logging
 import re
 from collections import Counter
 from typing import Any
 
 from app.rag.embeddings import embed_query
 from app.rag.qdrant_store import QdrantStore
+from app.rag.reranker import rerank_pairs
 from app.rag.schemas import RetrievedItem
 
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_TOP_K = 3
 VECTOR_CANDIDATE_MULTIPLIER = 4
@@ -18,6 +22,63 @@ BM25_B = 0.75
 RRF_K = 60.0
 DOCUMENT_FOCUS_TOP_DOCS = 2
 DOCUMENT_FOCUS_CANDIDATE_LIMIT = 256
+
+
+def _apply_semantic_reranker(
+    query: str,
+    items: list[RetrievedItem],
+    *,
+    top_k: int,
+) -> list[RetrievedItem]:
+    if not query.strip() or not items:
+        return items[:top_k]
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not settings.reranker_enabled:
+        return items[:top_k]
+
+    candidate_limit = max(top_k, settings.reranker_max_candidates)
+    candidates = items[:candidate_limit]
+
+    try:
+        scores = rerank_pairs(query, [item.content for item in candidates])
+    except Exception as exc:
+        logger.warning("Semantic reranker failed; keeping heuristic ranking. Reason: %s", exc)
+        return items[:top_k]
+
+    rescored: list[tuple[float, int]] = []
+    for index, (item, score) in enumerate(zip(candidates, scores)):
+        rescored.append((float(score), index))
+
+    rescored.sort(key=lambda entry: entry[0], reverse=True)
+
+    reranked_items: list[RetrievedItem] = []
+    for rank, (score, index) in enumerate(rescored[:top_k], start=1):
+        item = candidates[index]
+        reranked_items.append(
+            RetrievedItem(
+                chunk_id=item.chunk_id,
+                document_id=item.document_id,
+                source_name=item.source_name,
+                title=item.title,
+                content=item.content,
+                score=score,
+                metadata={
+                    **item.metadata,
+                    "rank": rank,
+                    "reranker_model": settings.reranker_model,
+                    "reranker_score": score,
+                },
+            )
+        )
+
+    return reranked_items
+
+
+def _contains_cjk(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text))
 
 
 def _tokenize_for_bm25(text: str) -> list[str]:
@@ -45,6 +106,12 @@ def _title_text(item: RetrievedItem) -> str:
     return " ".join(part for part in parts if part)
 
 
+def _section_text(item: RetrievedItem) -> str:
+    section_title = str(item.metadata.get("section_title", "")).strip()
+    section_path_text = str(item.metadata.get("section_path_text", "")).strip()
+    return " ".join(part for part in (section_title, section_path_text) if part)
+
+
 def _query_tokens(query: str) -> list[str]:
     return _tokenize_for_bm25(query)
 
@@ -65,6 +132,103 @@ def _title_match_strength(query_tokens: list[str], item: RetrievedItem) -> float
         if token.lower() in title_text:
             score += 1.0
     return score
+
+
+def _section_match_strength(query_tokens: list[str], item: RetrievedItem) -> float:
+    section_text = _section_text(item).lower()
+    if not section_text:
+        return 0.0
+
+    score = 0.0
+    seen_tokens: set[str] = set()
+    for token in query_tokens:
+        if token in seen_tokens:
+            continue
+        seen_tokens.add(token)
+        if len(token) <= 1:
+            continue
+        if token.lower() in section_text:
+            score += 1.0
+    return score
+
+
+def _is_document_level_section(item: RetrievedItem) -> bool:
+    section_title = str(item.metadata.get("section_title", "")).strip().lower()
+    if not section_title:
+        return False
+
+    title = item.title.rsplit(".", 1)[0].strip().lower()
+    file_stem = str(item.metadata.get("file_stem", "")).strip().lower()
+    return section_title in {title, file_stem}
+
+
+def _looks_like_structured_query(query: str) -> bool:
+    lowered = query.lower()
+    signals = [
+        "compare",
+        "comparison",
+        "versus",
+        "vs",
+        "better",
+        "difference",
+        "ability",
+        "abilities",
+        "role",
+        "strength",
+        "对比",
+        "比较",
+        "差异",
+        "哪个",
+        "更强",
+        "厉害",
+        "能力",
+        "定位",
+        "作用",
+    ]
+    if any(signal in lowered for signal in signals):
+        return True
+    if _contains_cjk(query):
+        return len(_tokenize_for_bm25(query)) >= 8
+    return len(_tokenize_for_bm25(query)) >= 6
+
+
+def _chunk_information_density(item: RetrievedItem) -> float:
+    content = item.content.strip()
+    if not content:
+        return 0.0
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", content) if part.strip()]
+    if not paragraphs:
+        paragraphs = [content]
+
+    short_paragraphs = sum(1 for paragraph in paragraphs if len(paragraph) <= 20)
+    numeric_markers = len(re.findall(r"\d+[%./]?\d*", content))
+    label_markers = len(re.findall(r"[：:]", content))
+
+    score = min(numeric_markers * 0.08, 0.4) + min(label_markers * 0.04, 0.2)
+
+    if len(paragraphs) >= 5 and short_paragraphs / len(paragraphs) >= 0.7:
+        score -= 0.45
+
+    script_families = 0
+    for pattern in (r"[A-Za-z]", r"[\u4e00-\u9fff]", r"[\u3040-\u30ff]", r"[\uac00-\ud7af]"):
+        if re.search(pattern, content):
+            script_families += 1
+    if script_families >= 3 and len(paragraphs) >= 4:
+        score -= 0.3
+
+    return score
+
+
+def _structured_section_bonus(query: str, item: RetrievedItem) -> float:
+    section_title = str(item.metadata.get("section_title", "")).strip()
+    if not section_title or _is_document_level_section(item):
+        return 0.0
+
+    bonus = 0.2
+    if _looks_like_structured_query(query):
+        bonus += 0.55
+    return bonus
 
 
 def _compute_bm25_scores(
@@ -254,6 +418,9 @@ def _rank_documents(
             channel_bonus += 0.2
         if isinstance(retrieval_channels, list) and "vector" in retrieval_channels:
             channel_bonus += 0.1
+        channel_bonus += min(_section_match_strength(query_tokens, item) * 0.35, 1.2)
+        channel_bonus += _structured_section_bonus(query, item)
+        channel_bonus += _chunk_information_density(item) * 0.25
 
         document_scores[item.document_id] = document_scores.get(item.document_id, 0.0) + base_score + title_score + channel_bonus
 
@@ -296,9 +463,20 @@ def _document_focused_retrieve(
         for index, item in enumerate(candidates):
             title_score = title_scores[index]
             content_score = content_scores[index]
+            section_score = _section_match_strength(query_tokens, item)
             chunk_index = int(item.metadata.get("chunk_index", 0) or 0)
             position_prior = max(0.0, 1.0 - (0.03 * chunk_index))
-            combined_score = (3.0 * title_score) + content_score + document_score + position_prior
+            section_bonus = _structured_section_bonus(query, item)
+            information_density = _chunk_information_density(item)
+            combined_score = (
+                (3.0 * title_score)
+                + content_score
+                + (1.4 * section_score)
+                + document_score
+                + position_prior
+                + section_bonus
+                + information_density
+            )
             if combined_score <= 0:
                 continue
             chunk_ranked.append((combined_score, index))
@@ -391,13 +569,14 @@ def retrieve(
     )
 
     if focused_items:
-        return _fuse_results(
+        rerank_candidates = _fuse_results(
             fused_items,
             focused_items,
-            top_k=top_k,
+            top_k=max(top_k, vector_top_k),
         )
+        return _apply_semantic_reranker(cleaned_query, rerank_candidates, top_k=top_k)
 
-    return fused_items[:top_k]
+    return _apply_semantic_reranker(cleaned_query, fused_items, top_k=top_k)
 
 
 def items_to_docs(items: list[RetrievedItem]) -> list[str]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,8 @@ DEFAULT_CHUNK_SIZE = 500
 DEFAULT_CHUNK_OVERLAP = 100
 DEFAULT_BATCH_SIZE = 64
 INDEX_MANIFEST_FILE_NAME = "_index_manifest.json"
+MAX_SECTION_TITLE_LENGTH = 48
+MAX_SECTION_PATH_DEPTH = 6
 
 
 def _emit_progress(enabled: bool, message: str) -> None:
@@ -185,6 +188,162 @@ def normalize_text(text: str) -> str:
     return "\n\n".join(paragraphs).strip()
 
 
+def _iter_paragraph_spans(text: str) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    for match in re.finditer(r"(?:^|\n\n)(.+?)(?=\n\n|$)", text, re.DOTALL):
+        paragraph = match.group(1).strip()
+        if not paragraph:
+            continue
+        spans.append(
+            {
+                "text": paragraph,
+                "start": match.start(1),
+                "end": match.end(1),
+            }
+        )
+    return spans
+
+
+def _clean_section_title(paragraph: str) -> str:
+    cleaned = paragraph.strip()
+    cleaned = re.sub(r"^#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"\s*\[[^\]]{1,12}\]\s*$", "", cleaned)
+    cleaned = re.sub(r"^\d+(?:\.\d+)*\s+", "", cleaned)
+    return cleaned.strip(" -:：")
+
+
+def _infer_section_level(paragraph: str) -> int:
+    stripped = paragraph.lstrip()
+    heading_match = re.match(r"^(#{1,6})\s+", stripped)
+    if heading_match:
+        return len(heading_match.group(1))
+
+    numbered_match = re.match(r"^(\d+(?:\.\d+)*)\s+", stripped)
+    if numbered_match:
+        return min(numbered_match.group(1).count(".") + 1, MAX_SECTION_PATH_DEPTH)
+
+    return 1
+
+
+def _looks_like_section_heading(paragraph: str) -> bool:
+    stripped = paragraph.strip()
+    if not stripped:
+        return False
+
+    cleaned = _clean_section_title(stripped)
+    if not cleaned or len(cleaned) > MAX_SECTION_TITLE_LENGTH:
+        return False
+
+    if "\n" in stripped:
+        return False
+
+    if re.match(r"^#{1,6}\s+", stripped):
+        return True
+    if re.match(r"^\d+(?:\.\d+)*\s+", stripped):
+        return True
+    if re.search(r"\[[^\]]{1,12}\]\s*$", stripped):
+        return True
+
+    if re.search(r"[。！？!?；;]", cleaned):
+        return False
+
+    return len(cleaned.split()) <= 8 and len(cleaned) <= 18
+
+
+def _extract_section_spans(text: str) -> list[dict[str, Any]]:
+    section_spans: list[dict[str, Any]] = []
+    section_stack: list[str] = []
+
+    for paragraph in _iter_paragraph_spans(text):
+        raw_text = str(paragraph["text"])
+        if not _looks_like_section_heading(raw_text):
+            continue
+
+        title = _clean_section_title(raw_text)
+        if not title:
+            continue
+
+        level = _infer_section_level(raw_text)
+        target_depth = max(level - 1, 0)
+        section_stack = section_stack[:target_depth]
+        section_stack.append(title)
+
+        section_spans.append(
+            {
+                "start": paragraph["start"],
+                "end": paragraph["end"],
+                "section_title": title,
+                "section_level": level,
+                "section_path": list(section_stack),
+                "section_path_text": " / ".join(section_stack),
+            }
+        )
+
+    return section_spans
+
+
+def _annotate_chunks_with_sections(
+    chunks: list[dict[str, Any]],
+    *,
+    normalized_text: str,
+) -> list[dict[str, Any]]:
+    if not chunks:
+        return []
+
+    section_spans = _extract_section_spans(normalized_text)
+    if not section_spans:
+        return chunks
+
+    section_regions: list[dict[str, Any]] = []
+    for index, section in enumerate(section_spans):
+        next_start = (
+            int(section_spans[index + 1]["start"])
+            if index + 1 < len(section_spans)
+            else len(normalized_text)
+        )
+        section_regions.append(
+            {
+                **section,
+                "region_start": int(section["start"]),
+                "region_end": next_start,
+            }
+        )
+
+    annotated: list[dict[str, Any]] = []
+
+    for chunk in chunks:
+        chunk_start = int(chunk["start"])
+        chunk_end = int(chunk["end"])
+        best_section: dict[str, Any] | None = None
+        best_overlap = 0
+
+        for section in section_regions:
+            overlap_start = max(chunk_start, int(section["region_start"]))
+            overlap_end = min(chunk_end, int(section["region_end"]))
+            overlap = overlap_end - overlap_start
+            if overlap <= 0:
+                continue
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_section = section
+
+        if best_section is None:
+            annotated.append(chunk)
+            continue
+
+        annotated.append(
+            {
+                **chunk,
+                "section_title": best_section["section_title"],
+                "section_level": best_section["section_level"],
+                "section_path": list(best_section["section_path"]),
+                "section_path_text": best_section["section_path_text"],
+            }
+        )
+
+    return annotated
+
+
 def split_text(
     text: str,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -248,7 +407,7 @@ def split_text(
 
         start = next_start
 
-    return chunks
+    return _annotate_chunks_with_sections(chunks, normalized_text=normalized)
 
 
 def build_document_chunks(
@@ -294,6 +453,11 @@ def build_document_chunks(
             "chunk_end": item["end"],
             "chunk_count": total_chunks,
         }
+        if item.get("section_title"):
+            chunk_metadata["section_title"] = item["section_title"]
+            chunk_metadata["section_level"] = item["section_level"]
+            chunk_metadata["section_path"] = list(item.get("section_path", []))
+            chunk_metadata["section_path_text"] = item.get("section_path_text", "")
 
         chunks.append(
             DocumentChunk(
