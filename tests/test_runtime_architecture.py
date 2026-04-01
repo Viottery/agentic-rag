@@ -167,6 +167,22 @@ def test_build_subtask_initial_state_creates_isolated_single_task_runtime() -> N
     assert subtask_state["evidence"] == []
 
 
+def test_subtask_bootstrap_routes_local_kb_executor_to_program_service() -> None:
+    parent_state = _base_state("请从知识库介绍一下真理。")
+    task = {
+        "task_id": "t-rag",
+        "task_type": "rag",
+        "executor": "local_kb_retrieve",
+        "question": "介绍真理",
+        "success_criteria": "返回证据",
+        "status": "pending",
+    }
+
+    subtask_state = build_subtask_initial_state(parent_state, task)
+
+    assert subtask_graph_module.route_after_bootstrap(subtask_state) == "local_kb_retrieve_service"
+
+
 def test_execution_agent_records_structured_execution_result(monkeypatch) -> None:
     state = _base_state("请根据知识库介绍一下这个项目的整体架构。")
     state["fast_path_decision"]["mode"] = "single_skill"
@@ -262,7 +278,7 @@ def test_task_dispatcher_accepts_fast_single_skill_task_without_planner_selectio
 def test_subtask_graph_routes_are_executor_specific() -> None:
     assert subtask_graph_module.route_after_bootstrap(
         {"current_task": {"task_type": "rag", "executor": "local_kb_retrieve"}}
-    ) == "query_refiner"
+    ) == "local_kb_retrieve_service"
     assert subtask_graph_module.route_after_bootstrap(
         {"current_task": {"task_type": "action", "executor": "tool_execute"}}
     ) == "action_agent"

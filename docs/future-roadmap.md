@@ -17,6 +17,18 @@
 - `/chat` 已有 planner 驱动的多步执行雏形
 - 回答后处理已具备基础 grounding / verification 能力
 
+当前也已经暴露出一个明确的 runtime TODO：
+
+- 对“检索后还需要计算/执行”的问题，planner 可能重复派发近似 RAG 子任务
+- 当 `tool_execute` 返回 degraded 或 mock 结果时，planner 目前缺少足够强的熔断/收束逻辑
+- 这会导致同一问题在同一 scope 上重复检索，并重复尝试无效 action，形成空转链路
+
+同时，下一阶段还需要补齐另外一个基础能力：
+
+- 系统尚未真正引入 `conversation` 概念
+- 上下文仍以单请求状态为主，而不是会话化上下文
+- 多会话并发、单会话串行队列、trace 落盘、rolling summary 和长期记忆仍未进入主结构
+
 但这些能力目前仍然偏“节点化工作流”组织，而不是统一 runtime。
 
 下一阶段的目标不是继续堆旧 graph，而是：
@@ -37,6 +49,16 @@
 4. 将本地 RAG 打包为独立 service/API，而不是直接暴露给 planner
 5. 建立跨 Linux / Windows 的统一调用协议
 6. 设计 shell policy engine，给 execution agent 开放 shell 权限但加上风控
+
+此外，有一个应尽快纳入迁移计划的稳定性 TODO：
+
+7. 为 planner 增加重复子任务抑制与 degraded-action 熔断，避免空转或近似死循环
+
+在此基础上，新的上下文主线应加入：
+
+8. 引入 `conversation`、`turn`、`trace`、`summary`、`memory note` 五类上下文对象
+9. 引入多会话并发与单会话串行队列
+10. 将主图、子图和后处理链逐步迁移到 async 运行时
 
 ## 2. 架构重构主线
 
@@ -103,6 +125,13 @@ Planner 不负责：
 - 直接与 service API 交互
 - 在 prompt 里持有过多底层实现知识
 
+Planner 后续还需要补齐两个止损能力：
+
+- 重复检索抑制：
+  当新子任务与已完成子任务在 rewrite 后 query、route scope、目标实体上高度相似时，不再重复派发
+- degraded/mock 执行熔断：
+  当 execution result 已明确标记 `degraded=true` 且无法满足 success criteria 时，planner 应优先收束到回答或能力缺口说明，而不是继续重复 action
+
 也就是说，Planner 决定的是“做什么”和“交给谁做”，不是“怎么调用”。
 
 ### 2.3 Atomic Subtasks
@@ -118,6 +147,11 @@ Planner 不负责：
 
 子任务执行端允许保留局部策略，
 但不能再膨胀成新的全局调度器。
+
+对于“检索 + 计算”类问题，还需要明确一条规则：
+
+- 如果 calculation/action skill 尚未真实可用，就不应让 planner 通过重复派发同类 action 来“碰运气”
+- 这种场景应由 validator 或 planner 明确回报能力缺口，而不是制造额外迭代
 
 ### 2.4 Execution Agent
 
@@ -137,7 +171,111 @@ execution agent 是新主线里的关键主体。
 - 高可观测
 - 高可控
 
-## 3. Skill Registry
+从运行时角度，execution agent 还应满足：
+
+- 保留 async 执行入口
+- 支持未来对独立 subtasks 做 fan-out / fan-in
+- 将不依赖回答返回的落盘和整理步骤异步化
+
+## 3. Conversation 与上下文系统
+
+### 3.1 为什么现在必须引入 conversation
+
+如果没有 `conversation`，
+系统仍然会停留在“单请求工作流”层面。
+
+这会直接限制：
+
+- 短期上下文管理
+- 长期记忆沉淀
+- 多话题并发
+- 同一话题内部顺序一致性
+- turn 级 trace 和 summary 的可追踪性
+
+因此下一阶段必须正式引入：
+
+- `conversation`
+- `turn`
+- `turn trace`
+- `turn summary`
+- `memory note`
+
+### 3.2 短期上下文
+
+短期上下文建议采用：
+
+- recent turns 滑动窗口
+- rolling summary
+- active task snapshot
+- recent turn summaries
+
+也就是说，进入模型的上下文不应只是最近原始消息，
+而应是：
+
+- 最近轮次原文
+- 压缩后的会话摘要
+- 最近关键执行摘要
+- 当前未完成任务快照
+
+### 3.3 长期记忆
+
+长期记忆建议先使用：
+
+- SQLite 主存储
+- markdown/json 文件镜像
+
+长期记忆不保存原始对话全文，
+而保存整理后的 memory notes。
+
+### 3.4 原始 trace 的位置
+
+planner / execution / validator 的输出应被记录，
+但不应原样全部回注到 prompt。
+
+建议分层：
+
+- 原始 trace：存档
+- turn summary：短期上下文输入
+- memory note：长期记忆输入
+
+## 4. Async 运行时
+
+### 4.1 总原则
+
+系统设计从现在开始应默认保留异步性。
+
+需要同时满足：
+
+- 多个 conversation 可以并发
+- 同一 conversation 的多个 turn 必须串行
+- 不依赖顺序的子步骤尽量异步
+
+### 4.2 Conversation Queue Manager
+
+建议新增 `conversation queue manager`：
+
+- 每个 conversation 一个内部队列
+- 同会话只允许一个活动 turn
+- 不同会话可以在全局 worker pool 中并发
+
+### 4.3 会话过程异步调用
+
+`/chat` 后续应支持：
+
+- 同步等待结果
+- 后台提交 turn 并异步完成
+- 后续可扩展 SSE / websocket streaming
+
+### 4.4 可异步化的后处理
+
+以下步骤适合做 write-behind：
+
+- trace 落盘
+- turn summary 更新
+- memory candidate 提取
+- memory note 写入
+
+## 5. Skill Registry
 
 ### 3.1 为什么要引入 skill registry
 
@@ -194,7 +332,7 @@ skill 本身不提供服务。
 - 为本地 RAG service 提供一个稳定 skill entry
 - 让 execution agent 可以通过 skill 获得调用方法与 prompt 组织方式
 
-## 4. Service / API 主线
+## 6. Service / API 主线
 
 ### 4.1 为什么要 service 化
 
@@ -244,7 +382,7 @@ query normalize
 
 但近期重点仍然是先把本地 RAG service 做扎实。
 
-## 5. Shell Runtime 与跨平台策略
+## 7. Shell Runtime 与跨平台策略
 
 ### 5.1 shell 是主要执行通道
 
@@ -290,7 +428,7 @@ write request.json
   -> read result.json
 ```
 
-## 6. Shell 风控
+## 8. Shell 风控
 
 如果 shell 是主要交互通道，
 风控必须是 runtime 级能力，而不是 prompt 级提醒。
@@ -344,7 +482,7 @@ write request.json
 - max subprocesses
 - resource ceilings
 
-## 7. Grounding Validator
+## 9. Grounding Validator
 
 validator 的方向没有变化，
 仍然应从“轻量 citation 检查器”逐步升级为：
@@ -364,7 +502,7 @@ validator 不是第一优先级。
 - service 化
 - shell 风控
 
-## 8. 本地 RAG 主线
+## 10. 本地 RAG 主线
 
 ### 8.1 当前继续推进的内容
 
@@ -378,26 +516,33 @@ validator 不是第一优先级。
 - 父子索引 / 多层索引对象建设保留在 TODO
 - 不作为这一轮 execution-agent runtime 与 service 化的阻塞项
 
-## 9. 迁移顺序
+## 11. 迁移顺序
 
 建议按以下顺序推进：
 
 1. 先更新文档与架构认知
-2. 引入 fast gate
-3. 明确 planner 与 execution agent 的职责分离
-4. 定义统一 skill registry schema
-5. 将本地 RAG 重构为独立 service/API
-6. 设计统一 skill 调用 CLI
-7. 增加 Linux / Windows 平台适配模板
-8. 建立 shell policy engine
-9. 最后再升级 grounding validator
-10. 逐步清理旧 graph 中的硬编码节点链
+2. 引入 `conversation_id` 与 conversation-aware `/chat`
+3. 增加 turn / trace 持久化
+4. 增加 sliding window + rolling summary
+5. 增加长期 memory note 写入
+6. 引入 fast gate
+7. 明确 planner 与 execution agent 的职责分离
+8. 定义统一 skill registry schema
+9. 将本地 RAG 重构为独立 service/API
+10. 设计统一 skill 调用 CLI
+11. 增加 Linux / Windows 平台适配模板
+12. 建立 conversation queue manager
+13. 将主图和子图切向 async 运行
+14. 建立 shell policy engine
+15. 最后再升级 grounding validator
+16. 逐步清理旧 graph 中的硬编码节点链
 
-## 10. 长远目标
+## 12. 长远目标
 
 长远来看，这个项目的目标不是停留在“一个会检索的 agentic RAG demo”，
 而是成为一个更完整的 agent runtime：
 
+- 有 conversation 与 context system
 - 有 fast path
 - 有 planner loop
 - 有 execution agent

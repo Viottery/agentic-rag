@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from pathlib import Path
@@ -251,3 +252,48 @@ def test_apply_semantic_reranker_reorders_items_by_cross_encoder_score(monkeypat
 
     assert [item.chunk_id for item in reranked] == ["b", "a"]
     assert reranked[0].metadata["reranker_score"] == 0.95
+
+
+def test_aretrieve_as_context_uses_async_retrieve_results(monkeypatch) -> None:
+    async def _fake_aretrieve(  # noqa: ANN202
+        query: str,
+        *,
+        top_k: int = 3,
+        source_name: str | None = None,
+        top_level_group: str | None = None,
+        hierarchy_scope: str | None = None,
+        store=None,
+    ):
+        assert query == "真理的技能"
+        assert top_k == 2
+        assert source_name == "local_files"
+        assert top_level_group == "prts-wiki"
+        assert hierarchy_scope == "prts-wiki/干员"
+        return [
+            RetrievedItem(
+                chunk_id="truth-1",
+                document_id="doc-truth",
+                source_name="local_files",
+                title="1765-真理.txt",
+                content="技能二：文学风暴。",
+                score=0.88,
+                metadata={"rank": 1},
+            )
+        ]
+
+    monkeypatch.setattr(retriever_module, "aretrieve", _fake_aretrieve)
+
+    context = asyncio.run(
+        retriever_module.aretrieve_as_context(
+            "真理的技能",
+            top_k=2,
+            source_name="local_files",
+            top_level_group="prts-wiki",
+            hierarchy_scope="prts-wiki/干员",
+        )
+    )
+
+    assert context["retrieved_docs"] == ["技能二：文学风暴。"]
+    assert context["retrieved_sources"] == ["truth-1"]
+    assert len(context["evidence"]) == 1
+    assert context["evidence"][0]["metadata"]["query"] == "真理的技能"

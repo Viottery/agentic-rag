@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import urllib.error
 import urllib.request
@@ -55,6 +56,22 @@ def tavily_search(
     return json.loads(body)
 
 
+async def atavily_search(
+    query: str,
+    *,
+    api_key: str,
+    search_depth: str = "basic",
+    max_results: int = 5,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        tavily_search,
+        query,
+        api_key=api_key,
+        search_depth=search_depth,
+        max_results=max_results,
+    )
+
+
 def tavily_extract(
     urls: list[str],
     *,
@@ -98,3 +115,17 @@ def tavily_extract(
         raise RuntimeError(f"Tavily extract connection failed: {exc}") from exc
 
     return json.loads(body)
+
+
+async def atavily_extract(
+    urls: list[str],
+    *,
+    api_key: str,
+    extract_depth: str = "basic",
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        tavily_extract,
+        urls,
+        api_key=api_key,
+        extract_depth=extract_depth,
+    )

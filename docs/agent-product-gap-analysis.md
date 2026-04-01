@@ -258,6 +258,78 @@ crawl / local files
 
 ### 3.8 验证层仍未升级为真正的 grounding validator
 
+### 3.9 Planner 缺少对空转链路的抑制
+
+这是当前运行时成熟度里一个很现实的问题。
+
+在“先检索，再计算/执行”的问题上，当前系统可能出现：
+
+- 对同一实体、同一 scope 的近似重复 RAG 子任务
+- 在 action/tool 结果已经明确是 degraded 或 mock 时，继续重复派发类似 action
+- 最终靠 budget limit 或后置 validator/checker 才被动收束
+
+这类问题带来的影响包括：
+
+- 响应时间显著变长
+- 无效 LLM 调用增加
+- 用户会感觉系统在“想很多，但没有产生新信息”
+- trace 虽然可观测，但暴露出 planner 缺乏止损策略
+
+从产品视角看，这不是简单的“提示词不够好”，
+而是 runtime policy 缺口。
+
+成熟 runtime 至少需要：
+
+- 重复子任务判重
+- scope 级检索去重
+- degraded/mock action 熔断
+- 当能力缺口已经明确时，快速收束到 best-effort answer
+
+### 3.10 缺少 conversation-aware 的上下文系统
+
+当前系统仍然更接近：
+
+- 单请求执行
+- 单次状态返回
+- 缺少真正的 conversation 边界
+
+这会带来几个直接问题：
+
+- 不同话题线程无法稳定隔离
+- 短期上下文只能依赖当前请求状态
+- 长期记忆没有稳定入口
+- planner / execution / validator 的高层输出难以沉淀
+- 很难在产品层提供真正连续的多轮协作体验
+
+成熟 agent 产品需要的不只是聊天记录，
+而是：
+
+- `conversation`
+- `turn`
+- `execution trace`
+- `turn summary`
+- `memory note`
+
+这五类对象共同构成上下文基础设施。
+
+### 3.11 缺少多会话并发与单会话顺序保证
+
+如果没有 conversation queue，
+后续异步化会很容易出现上下文竞争问题。
+
+典型风险包括：
+
+- 同一 conversation 内多个请求同时修改 rolling summary
+- 长期记忆写入顺序混乱
+- planner 看到的不是稳定的最近状态
+- 用户在同一线程里触发前后 turn 交错
+
+因此成熟 runtime 需要明确：
+
+- 多个 conversation 可以并发
+- 同一 conversation 的 turn 必须串行
+- 不依赖顺序的后处理才适合异步 fan-out
+
 从产品视角看，当前“验证”还偏轻。
 
 当前重点更接近：

@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     reranker_max_candidates: int = 12
     agent_max_iterations: int = 6
     agent_max_duration_seconds: int = 90
+    agent_max_concurrent_conversations: int = 4
+    local_rag_socket_path: str = "/tmp/agentic-rag-local-rag.sock"
+    local_rag_retrieve_workers: int = 2
+    local_rag_embedding_batch_size: int = 8
+    local_rag_rerank_batch_tasks: int = 4
+    local_rag_subprocess_timeout_seconds: int = 150
     tavily_api_key: str = ""
     tavily_search_depth: str = "basic"
     tavily_max_results: int = 5

@@ -12,6 +12,9 @@ def build_initial_agent_state(
     *,
     max_iterations: int,
     max_duration_seconds: int,
+    conversation_id: str = "",
+    turn_id: str = "",
+    job_id: str = "",
 ) -> AgentState:
     """构造 /chat 主图的初始运行态。"""
     started_at_ts = time.time()
@@ -19,6 +22,9 @@ def build_initial_agent_state(
 
     return {
         # user input
+        "conversation_id": conversation_id,
+        "turn_id": turn_id,
+        "job_id": job_id,
         "question": question,
         "messages": [],
 

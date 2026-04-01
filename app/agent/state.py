@@ -144,6 +144,9 @@ class AgentState(TypedDict):
     """
 
     # user input
+    conversation_id: str
+    turn_id: str
+    job_id: str
     question: str
     messages: List[Dict[str, Any]]
 

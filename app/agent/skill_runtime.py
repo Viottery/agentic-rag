@@ -32,10 +32,7 @@ def execute_skill(state: AgentState, executor: str) -> AgentState:
 def _execute_local_kb_retrieve(state: AgentState) -> AgentState:
     from app.agent import nodes
 
-    updated = nodes.query_refiner(state)
-    updated = nodes.rag_router(updated)
-    updated = nodes.rag_agent(updated)
-    return updated
+    return nodes.local_kb_retrieve_service(state)
 
 
 def _execute_web_search_retrieve(state: AgentState) -> AgentState:

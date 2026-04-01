@@ -1,8 +1,10 @@
+from functools import lru_cache
 import os
 
 from langchain_openai import ChatOpenAI
 
 
+@lru_cache(maxsize=1)
 def get_chat_model() -> ChatOpenAI:
     """
     返回项目使用的 Chat 模型实例。

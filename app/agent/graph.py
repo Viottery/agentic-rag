@@ -1,6 +1,19 @@
 from langgraph.graph import END, StateGraph
 
-from app.agent.nodes import answer_synthesizer, execution_agent, fast_answer, fast_gate, planner, task_dispatcher, validator
+from app.agent.nodes import (
+    answer_synthesizer,
+    answer_synthesizer_async,
+    execution_agent,
+    execution_agent_async,
+    fast_answer,
+    fast_answer_async,
+    fast_gate,
+    planner,
+    planner_async,
+    task_dispatcher,
+    validator,
+    validator_async,
+)
 from app.agent.state import AgentState
 
 
@@ -48,7 +61,7 @@ def route_after_validator(state: AgentState) -> str:
 route_after_skill_executor = route_after_execution_agent
 
 
-def build_main_graph():
+def build_main_graph(*, async_mode: bool = False):
     """
     构建主编排图。
 
@@ -64,14 +77,21 @@ def build_main_graph():
     只需要调整 execution_agent 的调度方式，而不必重写主图。
     """
     graph = StateGraph(AgentState)
+    fast_answer_node = fast_answer_async if async_mode else fast_answer
+    planner_node = planner_async if async_mode else planner
+    execution_agent_node = execution_agent_async if async_mode else execution_agent
+    answer_synthesizer_node = (
+        answer_synthesizer_async if async_mode else answer_synthesizer
+    )
+    validator_node = validator_async if async_mode else validator
 
     graph.add_node("fast_gate", fast_gate)
-    graph.add_node("fast_answer", fast_answer)
-    graph.add_node("planner", planner)
+    graph.add_node("fast_answer", fast_answer_node)
+    graph.add_node("planner", planner_node)
     graph.add_node("task_dispatcher", task_dispatcher)
-    graph.add_node("execution_agent", execution_agent)
-    graph.add_node("answer_synthesizer", answer_synthesizer)
-    graph.add_node("validator", validator)
+    graph.add_node("execution_agent", execution_agent_node)
+    graph.add_node("answer_synthesizer", answer_synthesizer_node)
+    graph.add_node("validator", validator_node)
 
     graph.set_entry_point("fast_gate")
 
@@ -130,4 +150,5 @@ def build_main_graph():
 
 build_graph = build_main_graph
 main_agent_graph = build_main_graph()
+async_main_agent_graph = build_main_graph(async_mode=True)
 agent_graph = main_agent_graph

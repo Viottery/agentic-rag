@@ -15,6 +15,7 @@ The next practical goal is not to hardcode more fixed graph branches, and also n
 
 - `planner` only decomposes and assigns work
 - `execution agent` actually performs atomic tasks
+- `conversation` is the primary context boundary
 - `shell` is the primary execution substrate
 - `skill registry` provides organized invocation knowledge and prompt packaging
 - `service/API` provides the real capability, such as local RAG, search, or future tools
@@ -25,6 +26,8 @@ In the near term, this means:
 - restructuring the runtime around `planner -> atomic subtasks -> execution agent -> planner feedback`
 - reorganizing skills as searchable registry entries instead of Python executors
 - moving local RAG behind a dedicated service interface
+- introducing conversation-aware context loading, short-term memory, and long-term memory persistence
+- preserving async execution so multiple conversations can run concurrently while each conversation remains internally ordered
 - introducing shell policy and cross-platform invocation conventions for Linux and Windows
 
 In the longer term, this means evolving the system from an "agentic RAG demo" into a more complete agent runtime that can search, read and edit files, run code, call tools, build knowledge bases, and iteratively solve complex tasks.
@@ -35,10 +38,12 @@ The system is being refactored from a serial supervisor workflow into a two-path
 
 ```text
 user input
+  -> conversation loader
   -> fast gate
   -> direct answer
 
 user input
+  -> conversation loader
   -> fast gate
   -> planner
   -> subtask decomposition
@@ -47,6 +52,7 @@ user input
   -> skill lookup
   -> service / local environment / external resources
   -> structured results
+  -> async trace / summary / memory writeback
   -> planner
   -> answer synthesizer
   -> grounding validator
@@ -55,12 +61,15 @@ user input
 
 Current design characteristics:
 
+- `conversation` is the top-level context boundary for short-term context, long-term memory, and queueing
 - `fast gate` decides whether the request can return directly or must enter the planner loop
 - `planner` performs only global task decomposition, assignment, and stop/continue decisions
 - `execution agent` handles atomic tasks with strong execution ability and minimal local planning
+- multiple conversations should be able to execute concurrently, while turns inside a single conversation remain serialized through a queue
 - `shell` is the main interaction channel for the execution agent
 - `skill registry` stores invocation methods, prompt files, schemas, tags, and platform-specific launch guidance
 - `service/API` owns routing, retrieval, reranking, search, and future tool execution
+- `context system` owns sliding-window short-term context, rolling summaries, trace storage, and long-term memory notes
 - `grounding validator` remains part of the target architecture, but it is not the first migration priority in the current phase
 
 Important design notes:
@@ -75,6 +84,7 @@ More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/hom
 ## Docs
 
 - [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): target runtime architecture, planner and execution-agent boundaries, skill registry, service/API split, shell-first execution, and shell policy
+- [docs/context-memory-architecture.md](/home/viottery/workspace/agentic-rag/docs/context-memory-architecture.md): conversation model, short-term and long-term memory layers, trace recording, conversation queues, and async runtime boundaries
 - [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): staged migration plan for fast gate, execution-agent runtime, skill registry, service-ization, cross-platform CLI invocation, and shell risk control
 - [docs/agent-product-gap-analysis.md](/home/viottery/workspace/agentic-rag/docs/agent-product-gap-analysis.md): product-level reasons for moving from node-heavy orchestration to shell-first execution agents plus service-backed capabilities
 
@@ -103,6 +113,13 @@ This gives the system a predictable fallback:
 
 This is a deliberate tradeoff. It favors bounded execution and observability over perfect completeness.
 
+Async runtime direction:
+
+- multiple conversations may be processed concurrently
+- a single conversation should process turns through a queue to preserve context order
+- when a request does not need synchronous return, the runtime should support background turn execution
+- post-turn persistence, summary update, and long-term memory writeback should become async write-behind steps
+
 ## State Design
 
 The `/chat` endpoint currently returns a verbose state because the project is still in architecture-transition mode.
@@ -128,6 +145,8 @@ Important top-level fields today include:
 
 The next state shape is expected to move toward:
 
+- `conversation`
+- `turn`
 - `fast_path_decision`
 - `planner_state`
 - `subtasks`
@@ -137,6 +156,7 @@ The next state shape is expected to move toward:
 - `answer`
 - `validation`
 - `trace`
+- `memory_context`
 
 Important subtask fields today include:
 
@@ -155,6 +175,12 @@ Current design tradeoff:
 - That is intentional for now because it makes planner loops, skill packaging, and validation behavior easier to inspect.
 - Later, node-shaped fields can be slimmed down in favor of task/skill/result objects.
 
+Known runtime loop risk in the current transition phase:
+
+- for “retrieve then calculate/execute” questions, the planner may issue near-duplicate RAG subtasks before recognizing that the information gap is not retrieval-related
+- if `tool_execute` returns a degraded or mock result, the planner may retry similar action tasks instead of converging immediately
+- this is a known TODO for the planner loop, not expected final behavior
+
 ## Code Conventions
 
 Current repository conventions for this phase are:
@@ -169,11 +195,14 @@ Current repository conventions for this phase are:
 ## Current Limitations
 
 - The codebase still contains older node-oriented workflow structure and has not fully migrated to the planner plus execution-agent boundary.
+- The `/chat` route is not yet conversation-aware in its actual implementation and does not yet persist queue/job state.
 - Current "skills" in code are still transitional executor-style wrappers rather than a full registry of manifests, prompts, and service bindings.
 - Local RAG is still largely implemented in-process and has not yet been split into a dedicated service/API layer.
+- The context system described in the target architecture is not fully implemented yet: sliding-window loading, rolling summaries, long-term memory notes, and conversation queues are still pending.
 - The shell policy engine and cross-platform invocation layer are still design targets, not completed runtime components.
 - Validation is still lighter than the target grounding-validator design, but validator refactoring is not the first step in the current migration order.
 - Parent-child indexing remains a TODO rather than an active delivery item.
+- Planner loop stop-loss is still incomplete for degraded execution results, so repeated near-duplicate retrieval or mock-action retries can still appear on some multi-step questions.
 
 ## Project Structure
 
@@ -189,6 +218,7 @@ agentic-rag/
 │   └── raw/         # source documents for indexing
 ├── docs/
 │   ├── agent-product-gap-analysis.md
+│   ├── context-memory-architecture.md
 │   ├── future-roadmap.md
 │   └── langgraph-workflow-visualization.md
 ├── tests/

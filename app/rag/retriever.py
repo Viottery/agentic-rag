@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 import logging
 import re
@@ -7,6 +8,7 @@ from collections import Counter
 from typing import Any
 
 from app.rag.embeddings import embed_query
+from app.rag.inference_runtime import get_local_model_runtime
 from app.rag.qdrant_store import QdrantStore
 from app.rag.reranker import rerank_pairs
 from app.rag.schemas import RetrievedItem
@@ -44,6 +46,67 @@ def _apply_semantic_reranker(
 
     try:
         scores = rerank_pairs(query, [item.content for item in candidates])
+    except Exception as exc:
+        logger.warning("Semantic reranker failed; keeping heuristic ranking. Reason: %s", exc)
+        return items[:top_k]
+
+    rescored: list[tuple[float, int]] = []
+    for index, (item, score) in enumerate(zip(candidates, scores)):
+        rescored.append((float(score), index))
+
+    rescored.sort(key=lambda entry: entry[0], reverse=True)
+
+    reranked_items: list[RetrievedItem] = []
+    for rank, (score, index) in enumerate(rescored[:top_k], start=1):
+        item = candidates[index]
+        reranked_items.append(
+            RetrievedItem(
+                chunk_id=item.chunk_id,
+                document_id=item.document_id,
+                source_name=item.source_name,
+                title=item.title,
+                content=item.content,
+                score=score,
+                metadata={
+                    **item.metadata,
+                    "rank": rank,
+                    "reranker_model": settings.reranker_model,
+                    "reranker_score": score,
+                },
+            )
+        )
+
+    return reranked_items
+
+
+async def _apply_semantic_reranker_async(
+    query: str,
+    items: list[RetrievedItem],
+    *,
+    top_k: int,
+) -> list[RetrievedItem]:
+    if not query.strip() or not items:
+        return items[:top_k]
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    if not settings.reranker_enabled:
+        return items[:top_k]
+
+    candidate_limit = max(top_k, settings.reranker_max_candidates)
+    candidates = items[:candidate_limit]
+
+    runtime = get_local_model_runtime()
+    try:
+        if runtime is not None and runtime.started:
+            scores = await runtime.rerank_pairs(query, [item.content for item in candidates])
+        else:
+            scores = await asyncio.to_thread(
+                rerank_pairs,
+                query,
+                [item.content for item in candidates],
+            )
     except Exception as exc:
         logger.warning("Semantic reranker failed; keeping heuristic ranking. Reason: %s", exc)
         return items[:top_k]
@@ -635,6 +698,123 @@ def retrieve_as_context(
         store=store,
     )
 
+    return {
+        "retrieved_items": items,
+        "retrieved_docs": items_to_docs(items),
+        "retrieved_sources": items_to_sources(items),
+        "evidence": items_to_evidence(items, query=query),
+    }
+
+
+async def aretrieve(
+    query: str,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    source_name: str | None = None,
+    top_level_group: str | None = None,
+    hierarchy_scope: str | None = None,
+    store: QdrantStore | None = None,
+) -> list[RetrievedItem]:
+    cleaned_query = query.strip()
+    if not cleaned_query:
+        return []
+
+    if top_k <= 0:
+        raise ValueError("top_k 必须大于 0")
+
+    runtime = get_local_model_runtime()
+    if runtime is None or not runtime.started:
+        return await asyncio.to_thread(
+            retrieve,
+            query,
+            top_k=top_k,
+            source_name=source_name,
+            top_level_group=top_level_group,
+            hierarchy_scope=hierarchy_scope,
+            store=store,
+        )
+
+    rag_store = store or QdrantStore()
+    vector_top_k = max(top_k * VECTOR_CANDIDATE_MULTIPLIER, top_k)
+    query_vector = await runtime.embed_query(cleaned_query)
+
+    vector_items_task = asyncio.to_thread(
+        rag_store.search,
+        query_vector,
+        top_k=vector_top_k,
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+    )
+    bm25_candidates_task = asyncio.to_thread(
+        rag_store.scroll_items,
+        limit=max(vector_top_k, BM25_CANDIDATE_LIMIT),
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+    )
+    vector_items, bm25_candidates = await asyncio.gather(vector_items_task, bm25_candidates_task)
+
+    bm25_items = await asyncio.to_thread(
+        _bm25_retrieve,
+        cleaned_query,
+        bm25_candidates,
+        top_k=vector_top_k,
+    )
+    fused_items = _fuse_results(
+        vector_items,
+        bm25_items,
+        top_k=vector_top_k,
+    )
+
+    document_rankings = _rank_documents(cleaned_query, fused_items)
+    focused_items = await asyncio.to_thread(
+        _document_focused_retrieve,
+        cleaned_query,
+        top_k=vector_top_k,
+        rag_store=rag_store,
+        document_rankings=document_rankings,
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+    )
+
+    if focused_items:
+        rerank_candidates = _fuse_results(
+            fused_items,
+            focused_items,
+            top_k=max(top_k, vector_top_k),
+        )
+        return await _apply_semantic_reranker_async(
+            cleaned_query,
+            rerank_candidates,
+            top_k=top_k,
+        )
+
+    return await _apply_semantic_reranker_async(
+        cleaned_query,
+        fused_items,
+        top_k=top_k,
+    )
+
+
+async def aretrieve_as_context(
+    query: str,
+    *,
+    top_k: int = DEFAULT_TOP_K,
+    source_name: str | None = None,
+    top_level_group: str | None = None,
+    hierarchy_scope: str | None = None,
+    store: QdrantStore | None = None,
+) -> dict[str, Any]:
+    items = await aretrieve(
+        query,
+        top_k=top_k,
+        source_name=source_name,
+        top_level_group=top_level_group,
+        hierarchy_scope=hierarchy_scope,
+        store=store,
+    )
     return {
         "retrieved_items": items,
         "retrieved_docs": items_to_docs(items),

@@ -10,12 +10,14 @@
 
 新的目标架构是：
 
+- `conversation` 负责划分对话边界与上下文空间
 - `fast gate` 负责简单问题短链路
 - `planner` 只做全局拆分与分配
 - `execution agent` 负责执行原子任务
 - `shell` 是 execution agent 与本地环境、外部能力交互的主要通道
 - `skill registry` 提供可检索的调用描述、提示词和平台适配信息
 - `service/API` 提供真实能力，例如本地 RAG、搜索与工具服务
+- `context system` 负责短期上下文、长期记忆和 trace 落盘
 - `grounding validator` 负责结果与答案的关联性和可解释性约束
 - `shell policy engine` 负责风控
 
@@ -24,6 +26,7 @@
 ```text
 Client
   -> POST /chat
+  -> conversation loader / queue manager
   -> FastAPI route
   -> build initial state
   -> fast gate
@@ -37,6 +40,25 @@ Client
 - `app/agent/graph.py`
 
 但 graph 的长期职责将从“固定节点编排”逐步转向“runtime orchestration”。
+
+## 1.1 Conversation Layer
+
+`conversation` 是新的一级上下文边界。
+
+它负责：
+
+- 维护当前对话线程的短期上下文
+- 挂载 rolling summary 和 active task snapshot
+- 作为长期记忆的局部作用域
+- 作为队列调度的最小串行单元
+
+因此，graph 的输入不应再只有 `question`，
+而应逐步升级为：
+
+- `conversation`
+- `turn`
+- `memory_context`
+- `current user message`
 
 ## 2. 新的主流程
 
@@ -66,6 +88,7 @@ user input
 
 ```text
 user input
+  -> conversation context loader
   -> fast gate
   -> planner
   -> subtask decomposition
@@ -77,6 +100,7 @@ user input
   -> planner
   -> answer synthesizer
   -> grounding validator
+  -> async trace / summary / memory writer
   -> END or back to planner
 ```
 
@@ -88,6 +112,35 @@ user input
 - skill 提供调用知识，不提供服务
 - service 提供真实能力
 - validator 决定“结果是否真的支撑答案”
+
+## 2.3 Async Runtime Boundary
+
+从现在开始，运行时设计应保留异步性。
+
+总体原则：
+
+- 不同 conversation 可以并发处理
+- 同一 conversation 的多个 turn 必须串行
+- 单个 turn 内部不依赖顺序的步骤应优先异步化
+
+推荐结构：
+
+```text
+POST /chat
+  -> persist turn/job
+  -> enqueue into conversation queue
+  -> conversation worker
+  -> main graph ainvoke
+  -> persist trace
+  -> spawn async summary + memory writeback
+```
+
+这意味着：
+
+- FastAPI route 应优先支持 async handler
+- 主图应优先暴露 `ainvoke`
+- 子任务图应优先暴露 async 入口
+- summary / memory writeback 应采用 write-behind 模式
 
 ## 3. 角色边界
 
@@ -130,6 +183,12 @@ Execution agent 是实际执行子任务的主体。
 
 Execution agent 允许有局部策略，
 但不应在子任务内部再演化成新的全局 planner。
+
+同样重要的是：
+
+- execution agent 的执行入口应优先是 async
+- 如果 planner 输出多个独立原子任务，execution agent runtime 后续应支持 fan-out / fan-in
+- 这种并行只发生在单 turn 内部，不改变 conversation 级串行保证
 
 ### 3.3 Skill Registry
 
@@ -186,7 +245,33 @@ validator 不再只是“引用覆盖率检查器”。
 - 给 planner 返回补任务建议
 - 抑制 hallucination
 
-## 4. Skill Registry 组织方式
+## 4. Context System
+
+上下文系统负责四类对象：
+
+- `recent turns`
+- `rolling summary`
+- `execution trace`
+- `memory notes`
+
+建议上下文拼装方式：
+
+```text
+system prompt
+  + rolling summary
+  + recent turns window
+  + recent turn summaries
+  + recalled memory notes
+  + current turn message
+```
+
+原则：
+
+- 原始 trace 存档，不直接全部注入 prompt
+- turn summary 才是短期上下文的主要输入
+- 长期记忆使用整理后的 memory notes，而不是原始对话全文
+
+## 5. Skill Registry 组织方式
 
 skill 应组织成一个便于检索和索引的 registry，
 而不是散落在节点实现里。
@@ -213,7 +298,7 @@ skill 应组织成一个便于检索和索引的 registry，
 - `platform_invocation`
   说明在 Linux / Windows 下如何通过 shell 调用
 
-## 5. Shell 作为主要交互通道
+## 6. Shell 作为主要交互通道
 
 execution agent 应保留较强的命令行能力。
 
@@ -237,7 +322,7 @@ execution agent 可以通过 shell：
 - shell 是基础执行通道
 - skill 是 shell 使用时的组织化知识层
 
-## 6. 跨平台策略
+## 7. 跨平台策略
 
 系统需要同时支持 Linux 和 Windows，
 同时尽量保留 LLM 的命令行技术优势。
@@ -287,7 +372,7 @@ write request.json
 这样既保留 shell 主通道，
 又能显著减少跨平台命令构造的不稳定性。
 
-## 7. Shell 风控
+## 8. Shell 风控
 
 如果 shell 是主要交互通道，
 风控必须是 runtime 级能力，而不是 prompt 级提醒。
@@ -341,11 +426,14 @@ write request.json
 - max subprocesses
 - resource ceilings
 
-## 8. State 设计方向
+## 9. State 设计方向
 
 下一阶段 state 应逐步围绕这些对象重构：
 
+- `conversation`
+- `turn`
 - `request`
+- `memory_context`
 - `fast_path_decision`
 - `planner_state`
 - `subtasks`
@@ -360,22 +448,27 @@ write request.json
 
 - 降低固定节点痕迹
 - 强化 task / skill / execution / validation 四类结构化对象
+- 增加 conversation / turn / memory 三类上下文对象
 - 让 planner 消费的是结果对象，而不是底层节点状态
 
-## 9. 近期迁移路径
+## 10. 近期迁移路径
 
 建议按以下顺序迁移：
 
 1. 保留 fast gate
-2. 明确 planner 与 execution agent 的职责分离
-3. 将 skill 从“执行逻辑”重构为“registry entry”
-4. 将本地 RAG 重构为独立 service/API
-5. 设计统一 skill 调用 CLI
-6. 增加 Linux / Windows 平台适配模板
-7. 建立 shell policy engine
-8. 最后再升级 grounding validator
+2. 引入 conversation-aware chat entry
+3. 增加 sliding window + rolling summary
+4. 增加 turn trace / turn summary / memory notes
+5. 明确 planner 与 execution agent 的职责分离
+6. 将 skill 从“执行逻辑”重构为“registry entry”
+7. 将本地 RAG 重构为独立 service/API
+8. 设计统一 skill 调用 CLI
+9. 增加 Linux / Windows 平台适配模板
+10. 建立 shell policy engine
+11. 将主图与子图逐步迁移到 async
+12. 最后再升级 grounding validator
 
-## 10. 当前明确不优先推进的事项
+## 11. 当前明确不优先推进的事项
 
 - 父子索引 / 多层索引对象建设仍保留在 TODO
 - 不优先继续扩张旧 graph 上的固定节点链

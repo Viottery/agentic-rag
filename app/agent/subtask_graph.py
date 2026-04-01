@@ -34,6 +34,8 @@ def bootstrap_subtask(state: SubtaskState) -> SubtaskState:
 
 def route_after_bootstrap(state: SubtaskState) -> str:
     executor = _executor(state)
+    if executor == "local_kb_retrieve":
+        return "local_kb_retrieve_service"
     if executor == "tool_execute":
         return "action_agent"
     return "query_refiner"
@@ -41,8 +43,6 @@ def route_after_bootstrap(state: SubtaskState) -> str:
 
 def route_after_query_refiner(state: SubtaskState) -> str:
     executor = _executor(state)
-    if executor == "local_kb_retrieve":
-        return "rag_router"
     if executor == "web_search_retrieve":
         return "search_agent"
     return "action_agent"
@@ -76,7 +76,7 @@ def finalize_subtask(state: SubtaskState) -> SubtaskState:
     }
 
 
-def build_subtask_graph():
+def build_subtask_graph(*, async_mode: bool = False):
     """
     单原子任务执行图。
 
@@ -90,13 +90,24 @@ def build_subtask_graph():
     后续如果要做异步分发或多任务并行，主图只需要调度该图的运行实例。
     """
     graph = StateGraph(SubtaskState)
+    local_kb_retrieve_node = (
+        nodes.local_kb_retrieve_service_async
+        if async_mode
+        else nodes.local_kb_retrieve_service
+    )
+    query_refiner_node = nodes.query_refiner_async if async_mode else nodes.query_refiner
+    rag_router_node = nodes.rag_router_async if async_mode else nodes.rag_router
+    rag_agent_node = nodes.rag_agent_async if async_mode else nodes.rag_agent
+    search_agent_node = nodes.search_agent_async if async_mode else nodes.search_agent
+    action_agent_node = nodes.action_agent_async if async_mode else nodes.action_agent
 
     graph.add_node("bootstrap", bootstrap_subtask)
-    graph.add_node("query_refiner", nodes.query_refiner)
-    graph.add_node("rag_router", nodes.rag_router)
-    graph.add_node("rag_agent", nodes.rag_agent)
-    graph.add_node("search_agent", nodes.search_agent)
-    graph.add_node("action_agent", nodes.action_agent)
+    graph.add_node("local_kb_retrieve_service", local_kb_retrieve_node)
+    graph.add_node("query_refiner", query_refiner_node)
+    graph.add_node("rag_router", rag_router_node)
+    graph.add_node("rag_agent", rag_agent_node)
+    graph.add_node("search_agent", search_agent_node)
+    graph.add_node("action_agent", action_agent_node)
     graph.add_node("finalize", finalize_subtask)
 
     graph.set_entry_point("bootstrap")
@@ -105,6 +116,7 @@ def build_subtask_graph():
         "bootstrap",
         route_after_bootstrap,
         {
+            "local_kb_retrieve_service": "local_kb_retrieve_service",
             "query_refiner": "query_refiner",
             "action_agent": "action_agent",
         },
@@ -120,6 +132,7 @@ def build_subtask_graph():
         },
     )
 
+    graph.add_edge("local_kb_retrieve_service", "finalize")
     graph.add_edge("rag_router", "rag_agent")
     graph.add_edge("rag_agent", "finalize")
     graph.add_edge("search_agent", "finalize")
@@ -130,6 +143,7 @@ def build_subtask_graph():
 
 
 subtask_agent_graph = build_subtask_graph()
+async_subtask_agent_graph = build_subtask_graph(async_mode=True)
 
 
 def invoke_subtask_graph(state: SubtaskState) -> SubtaskState:
@@ -139,4 +153,4 @@ def invoke_subtask_graph(state: SubtaskState) -> SubtaskState:
 
 async def ainvoke_subtask_graph(state: SubtaskState) -> SubtaskState:
     """异步执行子任务图，供未来并发调度使用。"""
-    return await subtask_agent_graph.ainvoke(state)
+    return await async_subtask_agent_graph.ainvoke(state)
