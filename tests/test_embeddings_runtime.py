@@ -5,6 +5,10 @@ import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.modules.setdefault(
+    "pydantic_settings",
+    types.SimpleNamespace(BaseSettings=object, SettingsConfigDict=lambda **kwargs: kwargs),
+)
 
 import app.core.config as config_module
 import app.rag.embeddings as embeddings_module
@@ -93,6 +97,9 @@ def test_get_embedding_model_uses_openvino_backend(monkeypatch) -> None:
     assert calls
     assert calls[0]["kwargs"]["backend"] == "openvino"
     assert calls[0]["kwargs"]["model_kwargs"] == {"device": "GPU"}
+    model = embeddings_module.get_embedding_model()
+    assert getattr(model, "_agentic_runtime_backend") == "openvino"
+    assert getattr(model, "_agentic_runtime_device") == "GPU"
 
 
 def test_get_embedding_model_falls_back_to_torch_when_openvino_init_fails(monkeypatch) -> None:
@@ -120,3 +127,26 @@ def test_get_embedding_model_falls_back_to_torch_when_openvino_init_fails(monkey
     assert len(calls) == 2
     assert calls[0]["kwargs"]["backend"] == "openvino"
     assert calls[1]["kwargs"]["device"] == "cpu"
+
+
+def test_describe_active_embedding_runtime_reports_fallback_result(monkeypatch) -> None:
+    class _FakeSentenceTransformer:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            if kwargs.get("backend") == "openvino":
+                raise RuntimeError("openvino init failed")
+
+    monkeypatch.setattr(config_module, "get_settings", lambda: _Settings())
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        types.SimpleNamespace(SentenceTransformer=_FakeSentenceTransformer),
+    )
+    monkeypatch.setattr(embeddings_module, "_openvino_gpu_available", lambda: True)
+    monkeypatch.setattr(embeddings_module, "_torch_cuda_available", lambda: False)
+    monkeypatch.setattr(embeddings_module, "_torch_xpu_available", lambda: False)
+    _clear_embedding_caches()
+
+    runtime = embeddings_module.describe_active_embedding_runtime()
+
+    assert runtime["backend"] == "torch"
+    assert runtime["device"] == "cpu"

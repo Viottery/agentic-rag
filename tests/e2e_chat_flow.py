@@ -57,6 +57,7 @@ def assert_common_shape(data: dict[str, Any]) -> None:
         "subtasks",
         "planner_control",
         "current_task",
+        "execution_results",
         "aggregated_context",
         "evidence",
         "retrieved_docs",

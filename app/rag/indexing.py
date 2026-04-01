@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from app.rag.embeddings import embed_texts
+from app.rag.embeddings import describe_active_embedding_runtime, embed_texts
 from app.rag.qdrant_store import QdrantStore
 from app.rag.schemas import DocumentChunk
 
@@ -478,6 +478,9 @@ def index_chunks(
     *,
     store: QdrantStore | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    embedding_model_name: str | None = None,
+    embedding_backend: str | None = None,
+    embedding_device: str | None = None,
     progress: bool = False,
     progress_prefix: str = "[index-chunks]",
 ) -> int:
@@ -511,7 +514,12 @@ def index_chunks(
         # - 实现简单，失败边界清晰
         # - 便于后续加入重试、监控、进度日志
         # 如果数据量进一步增大，再考虑并行 embedding / 异步 upsert。
-        batch_vectors = embed_texts(batch_texts)
+        batch_vectors = embed_texts(
+            batch_texts,
+            model_name=embedding_model_name,
+            backend=embedding_backend,
+            device=embedding_device,
+        )
         rag_store.upsert_chunks(batch_chunks, batch_vectors)
 
     return total
@@ -527,6 +535,9 @@ def index_document(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    embedding_model_name: str | None = None,
+    embedding_backend: str | None = None,
+    embedding_device: str | None = None,
     recreate: bool = True,
     store: QdrantStore | None = None,
     progress: bool = False,
@@ -558,6 +569,9 @@ def index_document(
         chunks,
         store=rag_store,
         batch_size=batch_size,
+        embedding_model_name=embedding_model_name,
+        embedding_backend=embedding_backend,
+        embedding_device=embedding_device,
         progress=progress,
         progress_prefix=f"[index-document] upsert {title}",
     )
@@ -583,6 +597,9 @@ def index_text_file(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    embedding_model_name: str | None = None,
+    embedding_backend: str | None = None,
+    embedding_device: str | None = None,
     recreate: bool = True,
     store: QdrantStore | None = None,
     progress: bool = False,
@@ -617,6 +634,9 @@ def index_text_file(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         batch_size=batch_size,
+        embedding_model_name=embedding_model_name,
+        embedding_backend=embedding_backend,
+        embedding_device=embedding_device,
         recreate=recreate,
         store=store,
         progress=progress,
@@ -631,6 +651,9 @@ def index_directory(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    embedding_model_name: str | None = None,
+    embedding_backend: str | None = None,
+    embedding_device: str | None = None,
     recreate: bool = True,
     store: QdrantStore | None = None,
     progress: bool = False,
@@ -659,6 +682,19 @@ def index_directory(
     total_files = len(files)
 
     _emit_progress(progress, f"[index-dir] start files={total_files} root={dir_path}")
+    runtime_info = describe_active_embedding_runtime(
+        model_name=embedding_model_name,
+        backend=embedding_backend,
+        device=embedding_device,
+    )
+    _emit_progress(
+        progress,
+        "[index-dir] embedding "
+        f"model={runtime_info['model_name']} "
+        f"backend={runtime_info['backend']} "
+        f"device={runtime_info['device']} "
+        f"batch_size={batch_size}",
+    )
 
     for file_index, file_path in enumerate(files, start=1):
         _emit_progress_bar(
@@ -707,6 +743,9 @@ def index_directory(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             batch_size=batch_size,
+            embedding_model_name=embedding_model_name,
+            embedding_backend=embedding_backend,
+            embedding_device=embedding_device,
             recreate=recreate,
             store=rag_store,
             progress=progress,

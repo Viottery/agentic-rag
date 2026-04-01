@@ -10,8 +10,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agent.llm import get_chat_model
 from app.agent.prompt_loader import load_prompt
 from app.agent.rag_router_utils import fallback_rag_route
-from app.agent.schemas import CheckerDecision, PlannerDecision, QueryRewritePlan, RAGRoutePlan, SearchResultSelection
-from app.agent.state import AgentState, AgentStep, CitationItem, EvidenceItem, SubTask
+from app.agent.schemas import CheckerDecision, FastPathDecision, PlannerDecision, QueryRewritePlan, RAGRoutePlan, SearchResultSelection
+from app.agent.skill_runtime import task_type_to_executor
+from app.agent.state import AgentState, AgentStep, CitationItem, EvidenceItem, ExecutionResult, SkillResult, SubTask, SubtaskState
+from app.agent.state_factory import build_subtask_initial_state
 from app.core.config import get_settings
 from app.rag.qdrant_store import QdrantStore, render_structure_summary
 from app.rag.retriever import retrieve_as_context
@@ -31,6 +33,7 @@ def _format_subtasks(subtasks: list[SubTask]) -> str:
             (
                 f"- id={task.get('task_id', '')} "
                 f"type={task.get('task_type', '')} "
+                f"executor={task.get('executor', '')} "
                 f"status={task.get('status', '')} "
                 f"question={task.get('question', '')} "
                 f"result={_compact_task_result(task)}"
@@ -56,7 +59,12 @@ def _merge_subtasks(existing: list[SubTask], proposed: list[dict]) -> list[SubTa
             {
                 "task_id": task_id,
                 "task_type": item.get("task_type", prior.get("task_type", "rag")),
+                "executor": item.get(
+                    "executor",
+                    prior.get("executor", task_type_to_executor(item.get("task_type", prior.get("task_type", "rag")))),
+                ),
                 "question": item.get("question", prior.get("question", "")),
+                "success_criteria": item.get("success_criteria", prior.get("success_criteria", "")),
                 "status": prior.get("status", "pending"),
                 "result": prior.get("result", ""),
                 "evidence": prior.get("evidence", []),
@@ -116,12 +124,18 @@ def _replace_task(state: AgentState, replacement: SubTask) -> list[SubTask]:
 
 def _append_step(state: AgentState, action: str, action_input: str, observation: str) -> list[AgentStep]:
     step: AgentStep = {
-        "thought": state["thought"],
+        "thought": state.get("thought", ""),
         "action": action,
         "action_input": action_input,
         "observation": observation,
     }
     return [*state["intermediate_steps"], step]
+
+
+def _dump_model(model) -> dict:  # noqa: ANN001
+    if hasattr(model, "model_dump"):
+        return model.model_dump()
+    return model.dict()
 
 
 def _build_aggregated_context(subtasks: list[SubTask]) -> str:
@@ -131,11 +145,63 @@ def _build_aggregated_context(subtasks: list[SubTask]) -> str:
 
     return "\n\n".join(
         (
-            f"[{task.get('task_type', 'unknown')}] {task.get('question', '')}\n"
+            f"[{task.get('executor', task.get('task_type', 'unknown'))}] {task.get('question', '')}\n"
             f"{_compact_task_result(task)}"
         )
         for task in completed
     )
+
+
+def _task_executor(task: SubTask) -> str:
+    executor = task.get("executor", "").strip()
+    if executor:
+        return executor
+    return task_type_to_executor(task.get("task_type", "rag"))
+
+
+def _merge_unique_strings(existing: list[str], new_items: list[str]) -> list[str]:
+    merged = list(existing)
+    seen = set(existing)
+    for item in new_items:
+        cleaned = item.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            merged.append(cleaned)
+    return merged
+
+
+def _merge_evidence_lists(existing: list[EvidenceItem], new_items: list[EvidenceItem]) -> list[EvidenceItem]:
+    merged = list(existing)
+    seen: set[tuple[str, str]] = set()
+
+    for item in existing:
+        seen.add((item.get("source_id", ""), item.get("content", "")))
+
+    for item in new_items:
+        key = (item.get("source_id", ""), item.get("content", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def _to_skill_result(execution_result: ExecutionResult) -> SkillResult:
+    return {
+        "task_id": execution_result.get("task_id", ""),
+        "executor": execution_result.get("executor", ""),
+        "status": execution_result.get("status", "failed"),
+        "summary": execution_result.get("summary", ""),
+        "evidence_count": execution_result.get("evidence_count", 0),
+        "source_count": execution_result.get("source_count", 0),
+        "error": execution_result.get("error", ""),
+    }
+
+
+def _invoke_subtask_graph(state: SubtaskState) -> SubtaskState:
+    from app.agent.subtask_graph import invoke_subtask_graph
+
+    return invoke_subtask_graph(state)
 
 
 def _task_queries(task: SubTask) -> list[str]:
@@ -451,6 +517,72 @@ def _looks_like_noisy_chunk(text: str) -> bool:
     return False
 
 
+def _looks_like_multi_step_problem(question: str) -> bool:
+    lowered = question.lower()
+    signals = [
+        "对比",
+        "比较",
+        "分析",
+        "步骤",
+        "方案",
+        "为什么",
+        "how",
+        "compare",
+        "analysis",
+        "plan",
+        "then",
+        "并且",
+        "同时",
+        "以及",
+    ]
+    if any(signal in lowered for signal in signals):
+        return True
+    return len(_split_paragraphs(question)) >= 2 or len(_tokenize_for_match(question)) >= 28
+
+
+def _build_fast_path_decision(question: str) -> FastPathDecision:
+    cleaned = question.strip()
+    lowered = cleaned.lower()
+
+    if _looks_like_multi_step_problem(cleaned):
+        return FastPathDecision(
+            mode="planner_loop",
+            reason="question appears multi-step or requires decomposition.",
+        )
+
+    if any(marker in lowered for marker in ["最新", "今天", "当前", "联网", "搜索", "news", "latest", "current"]):
+        return FastPathDecision(
+            mode="single_skill",
+            reason="question looks time-sensitive or explicitly requests external search.",
+            executor="web_search_retrieve",
+            question=cleaned,
+            success_criteria="返回与问题直接相关的外部检索结果或补充证据。",
+        )
+
+    if any(marker in lowered for marker in ["执行", "计算", "转换", "uppercase", "lowercase", "action"]):
+        return FastPathDecision(
+            mode="single_skill",
+            reason="question looks like a single execution or transformation task.",
+            executor="tool_execute",
+            question=cleaned,
+            success_criteria="完成明确的执行或转换任务，并返回结构化结果。",
+        )
+
+    if any(marker in cleaned for marker in ["知识库", "项目", "仓库", "文档", "代码", "RAG", "架构", "本地"]):
+        return FastPathDecision(
+            mode="single_skill",
+            reason="question looks answerable from project-local or indexed knowledge.",
+            executor="local_kb_retrieve",
+            question=cleaned,
+            success_criteria="返回可直接支撑回答的本地证据。",
+        )
+
+    return FastPathDecision(
+        mode="direct_answer",
+        reason="question looks simple enough to answer directly.",
+    )
+
+
 def _task_similarity(left: str, right: str) -> float:
     left_tokens = set(_tokenize_for_match(left))
     right_tokens = set(_tokenize_for_match(right))
@@ -504,7 +636,9 @@ def _fallback_planner_decision(state: AgentState) -> PlannerDecision:
                 {
                     "task_id": "1",
                     "task_type": task_type,
+                    "executor": task_type_to_executor(task_type),
                     "question": question,
+                    "success_criteria": "返回解决当前问题所需的直接结果或证据。",
                 }
             ],
         )
@@ -520,7 +654,9 @@ def _fallback_planner_decision(state: AgentState) -> PlannerDecision:
                     {
                         "task_id": item.get("task_id", ""),
                         "task_type": item.get("task_type", "search"),
+                        "executor": item.get("executor", task_type_to_executor(item.get("task_type", "search"))),
                         "question": item.get("question", ""),
+                        "success_criteria": item.get("success_criteria", ""),
                     }
                     for item in subtasks
                     if item.get("task_id")
@@ -536,7 +672,9 @@ def _fallback_planner_decision(state: AgentState) -> PlannerDecision:
             {
                 "task_id": item.get("task_id", ""),
                 "task_type": item.get("task_type", "search"),
+                "executor": item.get("executor", task_type_to_executor(item.get("task_type", "search"))),
                 "question": item.get("question", ""),
+                "success_criteria": item.get("success_criteria", ""),
             }
             for item in subtasks
             if item.get("task_id")
@@ -766,6 +904,81 @@ def _mentions_limitations(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def fast_gate(state: AgentState) -> AgentState:
+    question = state["question"].strip()
+    decision = _build_fast_path_decision(question)
+    observation = f"fast gate decision={decision.mode} reason={decision.reason}"
+
+    if decision.mode != "single_skill":
+        return {
+            **state,
+            "fast_path_decision": _dump_model(decision),
+            "observation": observation,
+            "intermediate_steps": _append_step(state, "fast_gate", question, observation),
+        }
+
+    task_type = {
+        "local_kb_retrieve": "rag",
+        "web_search_retrieve": "search",
+        "tool_execute": "action",
+    }.get(decision.executor, "rag")
+    task: SubTask = {
+        "task_id": "fast-1",
+        "task_type": task_type,
+        "executor": decision.executor,
+        "question": decision.question.strip() or question,
+        "success_criteria": decision.success_criteria.strip(),
+        "status": "pending",
+        "result": "",
+        "evidence": [],
+        "sources": [],
+        "error": "",
+        "degraded": False,
+        "degraded_reason": "",
+        "rewritten_query": "",
+        "sub_queries": [],
+        "rewrite_reason": "",
+    }
+
+    return {
+        **state,
+        "fast_path_decision": _dump_model(decision),
+        "subtasks": [task],
+        "current_task": task,
+        "observation": observation,
+        "intermediate_steps": _append_step(state, "fast_gate", question, observation),
+    }
+
+
+def fast_answer(state: AgentState) -> AgentState:
+    question = state["question"].strip()
+    llm = get_chat_model()
+    messages = [
+        SystemMessage(
+            content=(
+                "You are the fast-path responder of an AI assistant. "
+                "Answer the user directly and concisely in the user's language. "
+                "Do not claim tool use, retrieval, or citations."
+            )
+        ),
+        HumanMessage(content=question),
+    ]
+
+    response = llm.invoke(messages)
+    answer_text = str(response.content).strip()
+
+    return {
+        **state,
+        "answer": answer_text,
+        "answer_draft": answer_text,
+        "grounded_answer": answer_text,
+        "status": "finished",
+        "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "observation": "fast path answered directly.",
+        "intermediate_steps": _append_step(state, "fast_answer", question, "direct answer returned"),
+    }
+
+
 def planner(state: AgentState) -> AgentState:
     """
     planner 节点。
@@ -811,7 +1024,7 @@ def planner(state: AgentState) -> AgentState:
         decision = _fallback_planner_decision(state)
     merged_subtasks = _merge_subtasks(
         state["subtasks"],
-        [item.model_dump() for item in decision.subtasks],
+        [_dump_model(item) for item in decision.subtasks],
     )
 
     selected_task = _find_selected_task(merged_subtasks, decision.selected_task_id)
@@ -881,14 +1094,159 @@ def planner(state: AgentState) -> AgentState:
     }
 
 
-def dispatcher(state: AgentState) -> AgentState:
+def execution_agent(state: AgentState) -> AgentState:
+    task = state.get("current_task", {})
+    task_id = task.get("task_id", "").strip()
+    if not task_id:
+        observation = "no selected subtask for execution agent; returning to planner."
+        return {
+            **state,
+            "observation": observation,
+            "intermediate_steps": _append_step(state, "execution_agent", "", observation),
+        }
+
+    normalized_task: SubTask = {
+        **task,
+        "executor": _task_executor(task),
+        "status": "running",
+    }
+    subtask_state = build_subtask_initial_state(state, normalized_task)
+
+    try:
+        executed_state = _invoke_subtask_graph(subtask_state)
+        updated_task = executed_state.get("current_task", normalized_task)
+        execution_result = executed_state.get("execution_result", {})
+        subtasks = _replace_task(state, updated_task)
+
+        return {
+            **state,
+            "subtasks": subtasks,
+            "current_task": updated_task,
+            "execution_results": [*state.get("execution_results", []), execution_result],
+            "skill_results": [*state.get("skill_results", []), _to_skill_result(execution_result)],
+            "retrieved_docs": _merge_unique_strings(
+                state.get("retrieved_docs", []),
+                executed_state.get("retrieved_docs", []),
+            ),
+            "retrieved_sources": _merge_unique_strings(
+                state.get("retrieved_sources", []),
+                executed_state.get("retrieved_sources", []),
+            ),
+            "used_tools": _merge_unique_strings(
+                state.get("used_tools", []),
+                executed_state.get("used_tools", []),
+            ),
+            "evidence": _merge_evidence_lists(
+                state.get("evidence", []),
+                execution_result.get("evidence", []),
+            ),
+            "aggregated_context": _build_aggregated_context(subtasks),
+            "observation": executed_state.get(
+                "observation",
+                f"execution agent finished {updated_task.get('executor', '')}.",
+            ),
+            "error": execution_result.get("error", ""),
+            "intermediate_steps": _append_step(
+                state,
+                "execution_agent",
+                f"{task_id}:{updated_task.get('executor', '')}",
+                f"execution finished status={updated_task.get('status', 'done')}",
+            ),
+        }
+    except Exception as exc:
+        failed_task: SubTask = {
+            **normalized_task,
+            "status": "failed",
+            "error": str(exc),
+            "result": normalized_task.get("result", "") or "execution agent failed.",
+        }
+        failed_subtasks = _replace_task(state, failed_task)
+        execution_result: ExecutionResult = {
+            "task_id": task_id,
+            "executor": normalized_task.get("executor", ""),
+            "status": "failed",
+            "summary": failed_task["result"],
+            "evidence_count": 0,
+            "source_count": 0,
+            "error": str(exc),
+            "evidence": [],
+            "sources": [],
+            "retrieved_docs": [],
+            "retrieved_sources": [],
+            "used_tools": [],
+            "degraded": False,
+            "degraded_reason": "",
+            "trace": [],
+        }
+        observation = f"execution agent failed: {exc}"
+        return {
+            **state,
+            "subtasks": failed_subtasks,
+            "current_task": failed_task,
+            "execution_results": [*state.get("execution_results", []), execution_result],
+            "skill_results": [*state.get("skill_results", []), _to_skill_result(execution_result)],
+            "observation": observation,
+            "error": str(exc),
+            "intermediate_steps": _append_step(
+                state,
+                "execution_agent",
+                f"{task_id}:{normalized_task.get('executor', '')}",
+                observation,
+            ),
+        }
+
+
+def answer_synthesizer(state: AgentState) -> AgentState:
+    return answer_generator(state)
+
+
+def validator(state: AgentState) -> AgentState:
+    mapped = citation_mapper(state)
+    verified = verifier(mapped)
+    checked = checker(verified)
+
+    validation_summary = checked.get("verification_result", {}).get("summary", "")
+    if checked.get("checker_result", {}).get("passed", False):
+        observation = "grounding validator passed."
+    else:
+        observation = (
+            checked.get("checker_result", {}).get("feedback", "")
+            or validation_summary
+            or "grounding validator requests more work."
+        )
+
+    return {
+        **checked,
+        "observation": observation,
+        "intermediate_steps": _append_step(
+            checked,
+            "validator",
+            state.get("question", ""),
+            observation,
+        ),
+    }
+
+
+def task_dispatcher(state: AgentState) -> AgentState:
     """
-    dispatcher 节点。
+    task_dispatcher 节点。
 
     当前先做串行调度，但接口保留为 task-based，
     方便未来平滑升级为并行分发。
     """
     task_id = state["planner_control"].get("selected_task_id", "")
+    if not task_id:
+        task_id = state.get("current_task", {}).get("task_id", "")
+    if not task_id:
+        pending_task = next(
+            (
+                task
+                for task in state["subtasks"]
+                if task.get("status") in {"pending", "running"} and task.get("task_id")
+            ),
+            {},
+        )
+        task_id = pending_task.get("task_id", "")
     selected_task = _find_selected_task(state["subtasks"], task_id)
 
     if not selected_task:
@@ -903,7 +1261,7 @@ def dispatcher(state: AgentState) -> AgentState:
             "planner_control": planner_control,
             "observation": observation,
             "current_task": {},
-            "intermediate_steps": _append_step(state, "dispatcher", task_id, observation),
+            "intermediate_steps": _append_step(state, "task_dispatcher", task_id, observation),
         }
 
     if selected_task.get("status") == "done":
@@ -925,7 +1283,7 @@ def dispatcher(state: AgentState) -> AgentState:
                 "observation": observation,
                 "intermediate_steps": _append_step(
                     state,
-                    "dispatcher",
+                    "task_dispatcher",
                     f"{pending_task.get('task_id', '')}:{pending_task.get('task_type', '')}",
                     observation,
                 ),
@@ -943,7 +1301,7 @@ def dispatcher(state: AgentState) -> AgentState:
             "planner_control": planner_control,
             "observation": observation,
             "current_task": {},
-            "intermediate_steps": _append_step(state, "dispatcher", task_id, observation),
+            "intermediate_steps": _append_step(state, "task_dispatcher", task_id, observation),
         }
 
     subtasks = _set_task_status(state, task_id, "running")
@@ -955,11 +1313,21 @@ def dispatcher(state: AgentState) -> AgentState:
         "observation": f"已分发子任务 {task_id} 到 {selected_task.get('task_type', 'unknown')} agent。",
         "intermediate_steps": _append_step(
             state,
-            "dispatcher",
+            "task_dispatcher",
             f"{task_id}:{selected_task.get('task_type', '')}",
             "task dispatched",
         ),
     }
+
+
+def dispatcher(state: AgentState) -> AgentState:
+    """兼容旧名称；后续统一迁移到 task_dispatcher。"""
+    return task_dispatcher(state)
+
+
+def skill_executor(state: AgentState) -> AgentState:
+    """兼容旧名称；后续统一迁移到 execution_agent。"""
+    return execution_agent(state)
 
 
 def query_refiner(state: AgentState) -> AgentState:

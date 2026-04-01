@@ -10,8 +10,8 @@ class Settings(BaseSettings):
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
     embedding_model: str = "BAAI/bge-base-zh-v1.5"
-    embedding_backend: str = "auto"
-    embedding_device: str = "auto"
+    embedding_backend: str = "torch"
+    embedding_device: str = "cpu"
     reranker_enabled: bool = True
     reranker_model: str = "BAAI/bge-reranker-base"
     reranker_device: str = "auto"

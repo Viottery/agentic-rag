@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_EMBEDDING_BACKENDS = {"auto", "torch", "openvino"}
 SUPPORTED_EMBEDDING_DEVICES = {"auto", "gpu", "cpu", "cuda", "xpu"}
+_RUNTIME_LOGGED_KEYS: set[tuple[str, str, str]] = set()
+_MODEL_RUNTIME_BACKEND_ATTR = "_agentic_runtime_backend"
+_MODEL_RUNTIME_DEVICE_ATTR = "_agentic_runtime_device"
+_MODEL_RUNTIME_NAME_ATTR = "_agentic_runtime_model_name"
 
 
 def _normalize_backend_name(value: str | None) -> str:
@@ -171,11 +175,20 @@ def get_embedding_model(
 
     if resolved_backend == "openvino":
         try:
-            return SentenceTransformerModel(
+            model = SentenceTransformerModel(
                 resolved_model_name,
                 backend="openvino",
                 model_kwargs={"device": resolved_device},
             )
+            setattr(model, _MODEL_RUNTIME_NAME_ATTR, resolved_model_name)
+            setattr(model, _MODEL_RUNTIME_BACKEND_ATTR, "openvino")
+            setattr(model, _MODEL_RUNTIME_DEVICE_ATTR, resolved_device)
+            _log_embedding_runtime_once(
+                model_name=resolved_model_name,
+                backend="openvino",
+                device=resolved_device,
+            )
+            return model
         except Exception as exc:
             if backend not in {None, "", "auto"}:
                 raise
@@ -188,10 +201,76 @@ def get_embedding_model(
             )
             resolved_backend, resolved_device = ("torch", _default_torch_device())
 
-    return SentenceTransformerModel(
+    model = SentenceTransformerModel(
         resolved_model_name,
         device=resolved_device,
     )
+    setattr(model, _MODEL_RUNTIME_NAME_ATTR, resolved_model_name)
+    setattr(model, _MODEL_RUNTIME_BACKEND_ATTR, "torch")
+    setattr(model, _MODEL_RUNTIME_DEVICE_ATTR, resolved_device)
+    _log_embedding_runtime_once(
+        model_name=resolved_model_name,
+        backend="torch",
+        device=resolved_device,
+    )
+    return model
+
+
+def _log_embedding_runtime_once(*, model_name: str, backend: str, device: str) -> None:
+    runtime_key = (model_name, backend, device)
+    if runtime_key in _RUNTIME_LOGGED_KEYS:
+        return
+    _RUNTIME_LOGGED_KEYS.add(runtime_key)
+    logger.warning(
+        "Embedding runtime active: model=%s backend=%s device=%s",
+        model_name,
+        backend,
+        device,
+    )
+
+
+def describe_embedding_runtime(
+    *,
+    model_name: str | None = None,
+    backend: str | None = None,
+    device: str | None = None,
+) -> dict[str, str]:
+    """
+    返回当前 embedding 运行时的显式描述，便于建库日志和 CLI 诊断。
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    resolved_model_name = (model_name or settings.embedding_model).strip()
+    resolved_backend, resolved_device = resolve_embedding_runtime(backend, device)
+    return {
+        "model_name": resolved_model_name,
+        "backend": resolved_backend,
+        "device": resolved_device,
+    }
+
+
+def describe_active_embedding_runtime(
+    *,
+    model_name: str | None = None,
+    backend: str | None = None,
+    device: str | None = None,
+) -> dict[str, str]:
+    """
+    返回模型真实初始化后的 embedding 运行时。
+
+    与 `describe_embedding_runtime()` 不同，这里会实际加载模型，
+    因而能观察到 OpenVINO GPU 编译失败后的真实回退结果。
+    """
+    model = get_embedding_model(model_name, backend, device)
+    resolved_model_name = getattr(model, _MODEL_RUNTIME_NAME_ATTR, model_name or "")
+    resolved_backend = getattr(model, _MODEL_RUNTIME_BACKEND_ATTR, "")
+    resolved_device = getattr(model, _MODEL_RUNTIME_DEVICE_ATTR, "")
+    return {
+        "model_name": str(resolved_model_name),
+        "backend": str(resolved_backend),
+        "device": str(resolved_device),
+    }
 
 
 def embed_texts(

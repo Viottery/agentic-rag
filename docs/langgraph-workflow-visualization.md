@@ -2,14 +2,22 @@
 
 本文档描述项目下一阶段的目标架构。
 
-这份文档不再把系统理解为一条固定的
-`planner -> dispatcher -> query_refiner -> rag/search -> answer -> checker`
-串行链路，而是改为：
+这份文档不再把系统理解为：
 
-- `fast path` 优先处理简单问题
-- `planner loop` 处理复杂任务
-- `skill executor` 负责单一职责执行
-- `validator` 负责结果与答案的关联性、可解释性和幻觉抑制
+- planner 直接调用技能
+- skill 自身提供服务
+- graph 节点承担过多底层执行逻辑
+
+新的目标架构是：
+
+- `fast gate` 负责简单问题短链路
+- `planner` 只做全局拆分与分配
+- `execution agent` 负责执行原子任务
+- `shell` 是 execution agent 与本地环境、外部能力交互的主要通道
+- `skill registry` 提供可检索的调用描述、提示词和平台适配信息
+- `service/API` 提供真实能力，例如本地 RAG、搜索与工具服务
+- `grounding validator` 负责结果与答案的关联性和可解释性约束
+- `shell policy engine` 负责风控
 
 ## 1. 总入口
 
@@ -18,7 +26,7 @@ Client
   -> POST /chat
   -> FastAPI route
   -> build initial state
-  -> fast path gate
+  -> fast gate
   -> direct answer or planner loop
   -> return final response
 ```
@@ -28,7 +36,7 @@ Client
 - `app/api/routes/chat.py`
 - `app/agent/graph.py`
 
-但 graph 的职责将从“固定节点编排”逐步转向“runtime orchestration”。
+但 graph 的长期职责将从“固定节点编排”逐步转向“runtime orchestration”。
 
 ## 2. 新的主流程
 
@@ -50,7 +58,7 @@ user input
   -> return
 ```
 
-可选保留一个极轻量的 sanity check，但它不应演化成新的重链路。
+可选保留极轻量的 sanity check，但它不应演化成新的重链路。
 
 ### 2.2 Normal Path
 
@@ -61,131 +69,108 @@ user input
   -> fast gate
   -> planner
   -> subtask decomposition
-  -> skill executor(s)
-  -> structured task results
+  -> execution agent
+  -> shell interaction
+  -> skill lookup
+  -> service / local environment / external resources
+  -> structured task result
   -> planner
-  -> validator
   -> answer synthesizer
-  -> validator
+  -> grounding validator
   -> END or back to planner
 ```
 
-目标不是把所有未来任务都提前写成固定 workflow，
-而是建立一套稳定的 runtime 边界：
+这里有几个关键边界：
 
 - planner 决定“现在做什么”
-- skill executor 决定“如何完成当前原子任务”
+- execution agent 决定“如何完成当前原子任务”
+- shell 是主要交互通道
+- skill 提供调用知识，不提供服务
+- service 提供真实能力
 - validator 决定“结果是否真的支撑答案”
 
-## 3. 核心设计原则
+## 3. 角色边界
 
-### 3.1 简单问题不进大循环
-
-系统应该优先判断：
-
-- 是否可以直接回答
-- 是否只需要一次 skill 调用
-- 是否必须进入 planner loop
-
-建议 fast gate 的最小决策集为：
-
-- `direct_answer`
-- `single_skill`
-- `planner_loop`
-
-这样可以避免简单问题也被迫经历多轮 planner、检索、校验。
-
-### 3.2 Planner 只做全局决策
+### 3.1 Planner
 
 Planner 的职责应收敛为：
 
 - 识别当前信息缺口
 - 拆分单一职责子任务
-- 选择每个子任务的 executor / skill
-- 根据执行结果决定继续、补任务或进入回答
+- 决定将子任务交给哪个 execution agent
+- 基于返回结果决定继续、补任务、还是进入回答
 
-Planner 不负责：
+Planner 可以知道：
 
-- 子任务内部 query rewrite 细节
-- 本地检索路由细节
-- rerank 细节
-- 工具参数级微调
-- 最终引用映射细节
+- skill 列表
+- skill 的功能描述
+- skill 的适用场景
 
-一句话说，Planner 决定：
+但 Planner 不应直接：
 
-- `what to do`
-- `who should do it`
-- `what is still missing`
+- 调 skill
+- 拼 shell 命令
+- 决定底层调用参数细节
+- 直接与 service API 交互
 
-而不决定：
+一句话说：
 
-- `how exactly to do it`
+- Planner 只决定任务分配，不直接执行。
 
-### 3.3 子任务必须单一职责
+### 3.2 Execution Agent
 
-子任务设计原则：
+Execution agent 是实际执行子任务的主体。
 
-- 原子化
-- 可验证
-- 输入输出明确
-- 尽量避免内部再做 planner 式决策
+职责包括：
 
-子任务 executor 允许有“局部策略”，但不允许有“全局规划”。
+- 接收原子任务
+- 根据任务需要检索 skill
+- 通过 shell 与本地环境、服务或外部能力交互
+- 返回结构化 task result
+
+Execution agent 允许有局部策略，
+但不应在子任务内部再演化成新的全局 planner。
+
+### 3.3 Skill Registry
+
+skill 不应等于服务实现。
+
+skill 更适合作为：
+
+- 调用方法描述
+- 提示词包装
+- 输入输出约定
+- 平台适配信息
+- 使用建议
+
+skill 应可被检索、索引和注入 prompt，
+但 skill 本身不提供能力。
+
+可以把 skill 理解为：
+
+- `manifest + prompt package + invocation guide`
+
+### 3.4 Service / API
+
+真正的能力应由独立服务提供。
 
 例如：
 
-- `local_kb_retrieve` 内部可以做 query normalize、scope route、hybrid retrieval、rerank
-- 但它不应自己决定“是否改去搜索”或“是否继续拆任务”
+- `local_rag_service`
+- `web_search_service`
+- `tool_execution_service`
 
-这些判断必须回到 Planner。
+这些服务可以通过 FastAPI 暴露接口，
+负责真实执行：
 
-## 4. Skill Runtime
+- 路由
+- 检索
+- rerank
+- 搜索
+- 工具调用
+- 文件与系统交互
 
-### 4.1 为什么要用 skill 抽象
-
-系统的核心能力应逐步收敛为 skill，而不是让 planner 直接面向大量底层实现细节。
-
-这样做的价值：
-
-- 降低 planner prompt 的硬编码能力描述
-- 统一本地 RAG、搜索、工具调用的执行协议
-- 让执行结果更容易被 validator 和 planner 消费
-- 后续可平滑扩展更多 executor
-
-### 4.2 当前最重要的 skill
-
-近期最重要的 skill 是：
-
-- `local_kb_retrieve`
-
-它应把当前本地 RAG 的内部流程封装起来：
-
-```text
-query normalize
-  -> hierarchy routing
-  -> scoped hybrid recall
-  -> candidate fusion
-  -> semantic rerank
-  -> evidence selection
-  -> structured result
-```
-
-上层只看到：
-
-- 输入：任务目标、query、可选 scope hint
-- 输出：summary、evidence、sources、route trace、confidence、failure reason
-
-而不需要感知内部到底有多少检索步骤。
-
-后续可以并列增加：
-
-- `web_search_retrieve`
-- `tool_execute`
-- `file_read`
-- `code_run`
-
-## 5. Validator 的新定位
+### 3.5 Grounding Validator
 
 validator 不再只是“引用覆盖率检查器”。
 
@@ -195,20 +180,168 @@ validator 不再只是“引用覆盖率检查器”。
 
 职责包括：
 
-- 验证子任务执行结果是否真的满足任务目标
-- 验证最终答案是否被已有结果支持
+- 检查执行结果是否满足子任务目标
+- 检查最终答案是否被结果支撑
 - 标记强支持 / 弱支持 / 无支持结论
-- 给 planner 返回下一轮可执行反馈
-- 强化答案的可解释性
-- 尽量消除 hallucination
+- 给 planner 返回补任务建议
+- 抑制 hallucination
 
-它关注的不只是“有没有 citation”，而是：
+## 4. Skill Registry 组织方式
 
-- 结果和答案是否相关
-- 证据是否足够支撑结论
-- 哪些部分超出了执行结果边界
+skill 应组织成一个便于检索和索引的 registry，
+而不是散落在节点实现里。
 
-## 6. State 设计方向
+建议每个 skill 至少包含：
+
+- `skill_id`
+- `name`
+- `summary`
+- `when_to_use`
+- `when_not_to_use`
+- `input_schema`
+- `output_schema`
+- `prompt_files`
+- `service_binding`
+- `platform_invocation`
+- `tags`
+- `examples`
+
+这里最重要的两个字段是：
+
+- `service_binding`
+  指向真实 service/API
+- `platform_invocation`
+  说明在 Linux / Windows 下如何通过 shell 调用
+
+## 5. Shell 作为主要交互通道
+
+execution agent 应保留较强的命令行能力。
+
+shell 不应被视为例外能力，
+而应被视为：
+
+- execution agent 与外界交互的主要 substrate
+
+execution agent 可以通过 shell：
+
+- 访问项目工作区
+- 调用本地 CLI
+- 调用 skill 提供的推荐命令模板
+- 访问本地 service API
+- 调用受控外部服务
+
+这意味着 shell 不应被 skill 替代。
+
+更准确的关系是：
+
+- shell 是基础执行通道
+- skill 是 shell 使用时的组织化知识层
+
+## 6. 跨平台策略
+
+系统需要同时支持 Linux 和 Windows，
+同时尽量保留 LLM 的命令行技术优势。
+
+### 6.1 不强行统一 shell
+
+建议保留：
+
+- Linux: `bash`
+- Windows: `powershell`
+
+不要为了统一而抹掉各自的生态优势。
+
+### 6.2 统一调用协议，而不是统一命令字符串
+
+skill 不应只存一条 bash 命令。
+
+更合理的做法是：
+
+- skill 提供平台感知的调用模板
+- execution agent 根据当前 OS 选择相应模板
+
+例如：
+
+- Linux 调用模板
+- Windows 调用模板
+
+但它们都应指向同一 skill 和同一 service binding。
+
+### 6.3 尽量通过 CLI + 文件交换
+
+为了避免 bash / powershell 的引号和 JSON 转义问题，
+建议统一使用：
+
+- 输入文件
+- 输出文件
+- 统一 CLI 调用入口
+
+例如：
+
+```text
+write request.json
+  -> run skill client
+  -> read result.json
+```
+
+这样既保留 shell 主通道，
+又能显著减少跨平台命令构造的不稳定性。
+
+## 7. Shell 风控
+
+如果 shell 是主要交互通道，
+风控必须是 runtime 级能力，而不是 prompt 级提醒。
+
+建议至少包括以下层次。
+
+### 7.1 命令分级
+
+将命令按风险分层，例如：
+
+- `L0` 只读本地
+- `L1` 受控写入
+- `L2` 网络读取
+- `L3` 高风险写操作
+- `L4` 危险系统操作
+
+默认 execution agent 只拿到低到中风险权限。
+
+### 7.2 作用域限制
+
+限制：
+
+- 文件系统访问范围
+- 网络访问范围
+- 可继承环境变量
+- 可用可执行程序
+
+### 7.3 审计
+
+每条 shell 命令都应记录：
+
+- task id
+- agent id
+- command
+- cwd
+- start/end time
+- exit code
+- stdout/stderr 摘要
+
+### 7.4 破坏性命令拦截
+
+需要 runtime 层直接阻止高风险命令模式，
+而不是依赖 LLM 自觉避免。
+
+### 7.5 资源限制
+
+每条 shell 命令都应有：
+
+- timeout
+- max output
+- max subprocesses
+- resource ceilings
+
+## 8. State 设计方向
 
 下一阶段 state 应逐步围绕这些对象重构：
 
@@ -216,61 +349,42 @@ validator 不再只是“引用覆盖率检查器”。
 - `fast_path_decision`
 - `planner_state`
 - `subtasks`
+- `execution_results`
 - `skill_results`
 - `evidence`
 - `answer`
 - `validation`
 - `trace`
 
-相比当前 state，重点变化是：
+重点变化是：
 
 - 降低固定节点痕迹
-- 强化 task / skill / validation 三类结构化对象
-- 让 planner 消费的是“结果对象”，而不是底层节点临时状态
+- 强化 task / skill / execution / validation 四类结构化对象
+- 让 planner 消费的是结果对象，而不是底层节点状态
 
-## 7. 延迟与成本控制
-
-这套架构的直接目标之一，就是缩短简单问题链路并控制复杂问题成本。
-
-### 7.1 Fast Path 控制成本
-
-简单问题直接输出，避免：
-
-- planner 多轮循环
-- 多次 query rewrite
-- 无必要的检索与 rerank
-- validator 重链路
-
-### 7.2 Normal Path 控制成本
-
-复杂任务的优化方向应集中在：
-
-- 降低 planner 回合数
-- 让子任务更原子，减少重复工作
-- 让 skill 内部做强执行，而不是频繁回到 planner
-- 控制 reranker 候选规模
-- 仅在真正需要时追加 validator / 补任务
-
-## 8. 近期迁移路径
+## 9. 近期迁移路径
 
 建议按以下顺序迁移：
 
-1. 增加 fast gate，将简单问题从主循环中剥离
-2. 将本地 RAG 封装为 `local_kb_retrieve` skill
-3. 将现有 `rag/search/action` 统一到 skill executor 协议
-4. 重写 planner 输出 schema，改为“子任务 + executor/skill”
-5. 将 verifier / checker 逐步重构为 grounding validator
-6. 逐步减少旧串行 workflow 的硬编码分支
+1. 保留 fast gate
+2. 明确 planner 与 execution agent 的职责分离
+3. 将 skill 从“执行逻辑”重构为“registry entry”
+4. 将本地 RAG 重构为独立 service/API
+5. 设计统一 skill 调用 CLI
+6. 增加 Linux / Windows 平台适配模板
+7. 建立 shell policy engine
+8. 最后再升级 grounding validator
 
-## 9. 当前明确不优先推进的事项
+## 10. 当前明确不优先推进的事项
 
-- 父子索引 / 多层索引对象建设保留在 TODO
+- 父子索引 / 多层索引对象建设仍保留在 TODO
 - 不优先继续扩张旧 graph 上的固定节点链
 - 不优先把复杂性继续堆到 planner prompt 上
 
 当前优先级更高的是：
 
-- skill 抽象
-- planner loop 重构
-- semantic reranker 落地与调优
-- grounding validator 的职责重构
+- execution agent 边界
+- shell runtime
+- skill registry
+- service 化
+- shell 风控

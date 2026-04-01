@@ -1,6 +1,6 @@
 # Agentic-RAG
 
-Agentic-RAG is a learning-oriented backend project for evolving a simple RAG demo into a skill-oriented agent runtime with fast-path answering, planner-driven task decomposition, local retrieval, tool execution, and grounding validation.
+Agentic-RAG is a learning-oriented backend project for evolving a simple RAG demo into a shell-first agent runtime with fast-path answering, planner-driven task decomposition, execution agents, a searchable skill registry, and service-backed retrieval and tool capabilities.
 
 ## Project Goal
 
@@ -11,14 +11,21 @@ The project currently focuses on four things:
 - Qdrant-backed local RAG and Tavily-backed online search as the first real information abilities
 - A fast-path + planner-loop architecture that keeps simple questions short and complex tasks structured
 
-The next practical goal is not to hardcode more and more fixed workflows, but to package retrieval and tools into stable skills so the planner can reason over a smaller, cleaner action space.
+The next practical goal is not to hardcode more fixed graph branches, and also not to let skills become hidden service implementations. The intended boundary is:
+
+- `planner` only decomposes and assigns work
+- `execution agent` actually performs atomic tasks
+- `shell` is the primary execution substrate
+- `skill registry` provides organized invocation knowledge and prompt packaging
+- `service/API` provides the real capability, such as local RAG, search, or future tools
 
 In the near term, this means:
 
-- turning local RAG into a single callable skill with routing, recall, and rerank hidden behind one interface
 - adding a fast path so simple questions can return directly without entering the planner loop
-- restructuring the agent around `planner -> atomic subtasks -> skill execution -> planner feedback`
-- upgrading validation from lightweight citation checks into grounding validation over tool results and answers
+- restructuring the runtime around `planner -> atomic subtasks -> execution agent -> planner feedback`
+- reorganizing skills as searchable registry entries instead of Python executors
+- moving local RAG behind a dedicated service interface
+- introducing shell policy and cross-platform invocation conventions for Linux and Windows
 
 In the longer term, this means evolving the system from an "agentic RAG demo" into a more complete agent runtime that can search, read and edit files, run code, call tools, build knowledge bases, and iteratively solve complex tasks.
 
@@ -35,36 +42,41 @@ user input
   -> fast gate
   -> planner
   -> subtask decomposition
-  -> skill executor(s)
+  -> execution agent
+  -> shell interaction
+  -> skill lookup
+  -> service / local environment / external resources
   -> structured results
   -> planner
-  -> validator
   -> answer synthesizer
-  -> validator
+  -> grounding validator
   -> END or back to planner
 ```
 
 Current design characteristics:
 
-- `fast gate` decides whether the request can return directly, should use a single skill, or must enter the planner loop
-- `planner` only performs global task decomposition, executor selection, and missing-information decisions
-- `skill executor` handles atomic tasks with minimal local decision-making
-- `local_kb_retrieve` is becoming the main local RAG skill, encapsulating routing, hybrid recall, and reranking
-- `validator` is being repositioned as a grounding component that checks result-answer alignment and reduces hallucination
-- simple questions should avoid the multi-step planner loop whenever possible
+- `fast gate` decides whether the request can return directly or must enter the planner loop
+- `planner` performs only global task decomposition, assignment, and stop/continue decisions
+- `execution agent` handles atomic tasks with strong execution ability and minimal local planning
+- `shell` is the main interaction channel for the execution agent
+- `skill registry` stores invocation methods, prompt files, schemas, tags, and platform-specific launch guidance
+- `service/API` owns routing, retrieval, reranking, search, and future tool execution
+- `grounding validator` remains part of the target architecture, but it is not the first migration priority in the current phase
 
-Important design note:
+Important design notes:
 
-- the runtime should expose stable skills rather than many low-level node roles
-- the planner should reason over a smaller set of structured capabilities
-- future complex workflows should emerge from planning over skills, not from endless fixed graph branches
+- skills should be stable descriptors, not service implementations
+- planner may know skill metadata, but should not directly call skills or compose shell commands
+- execution agents should preserve strong command-line ability
+- cross-platform support should come from platform-aware invocation templates, not by flattening Linux and Windows into one shell model
 
 More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md).
 
 ## Docs
 
-- [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): target runtime architecture, fast/normal paths, planner boundary, skill runtime, and validator role
-- [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): staged migration plan for fast gate, skill abstraction, local RAG packaging, reranker, and validation
+- [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): target runtime architecture, planner and execution-agent boundaries, skill registry, service/API split, shell-first execution, and shell policy
+- [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): staged migration plan for fast gate, execution-agent runtime, skill registry, service-ization, cross-platform CLI invocation, and shell risk control
+- [docs/agent-product-gap-analysis.md](/home/viottery/workspace/agentic-rag/docs/agent-product-gap-analysis.md): product-level reasons for moving from node-heavy orchestration to shell-first execution agents plus service-backed capabilities
 
 ## Runtime Strategy
 
@@ -80,7 +92,7 @@ When the planner loop wants to continue but one of these limits has already been
 1. The runtime stops creating new work.
 2. It is forced into answer synthesis.
 3. The answer is prefixed with a clear limitation notice.
-4. Validation still runs so the result keeps grounding metadata.
+4. Validation and trace reporting can still run so the result keeps grounding metadata when needed.
 5. The system returns the best-effort answer rather than spinning.
 
 This gives the system a predictable fallback:
@@ -119,6 +131,7 @@ The next state shape is expected to move toward:
 - `fast_path_decision`
 - `planner_state`
 - `subtasks`
+- `execution_results`
 - `skill_results`
 - `evidence`
 - `answer`
@@ -147,18 +160,19 @@ Current design tradeoff:
 Current repository conventions for this phase are:
 
 - Keep the runtime explicit and debuggable rather than prematurely abstract.
-- Prefer packaging reusable retrieval or tool logic as skills instead of spreading it across planner prompts.
+- Prefer packaging reusable retrieval or tool logic behind services, and expose them to the runtime through organized skill metadata.
 - Use short docstrings and comments to explain orchestration intent, fallback behavior, or non-obvious trust constraints.
 - Treat search results, retrieved snippets, and generated drafts as untrusted data inside prompts.
 - Prefer conservative grounding: it is acceptable for validation to be stricter if that prevents weak evidence from being attached to the answer.
+- Keep shell usage observable and policy-controlled rather than hiding all execution behind opaque helpers.
 
 ## Current Limitations
 
-- The codebase still contains older node-oriented workflow structure and has not fully migrated to the new skill runtime.
-- `local_kb_retrieve` is still being packaged; some RAG logic remains spread across planner-facing nodes.
-- The fast path gate is not fully implemented yet.
-- Validation is still lighter than the target grounding-validator design.
-- Tool execution is still at an early stage and has not yet converged on the same skill contract as local retrieval.
+- The codebase still contains older node-oriented workflow structure and has not fully migrated to the planner plus execution-agent boundary.
+- Current "skills" in code are still transitional executor-style wrappers rather than a full registry of manifests, prompts, and service bindings.
+- Local RAG is still largely implemented in-process and has not yet been split into a dedicated service/API layer.
+- The shell policy engine and cross-platform invocation layer are still design targets, not completed runtime components.
+- Validation is still lighter than the target grounding-validator design, but validator refactoring is not the first step in the current migration order.
 - Parent-child indexing remains a TODO rather than an active delivery item.
 
 ## Project Structure
@@ -174,6 +188,7 @@ agentic-rag/
 ├── data/
 │   └── raw/         # source documents for indexing
 ├── docs/
+│   ├── agent-product-gap-analysis.md
 │   ├── future-roadmap.md
 │   └── langgraph-workflow-visualization.md
 ├── tests/
@@ -195,8 +210,8 @@ OPENAI_BASE_URL=...
 OPENAI_MODEL=...
 OPENAI_TEMPERATURE=0
 EMBEDDING_MODEL=BAAI/bge-base-zh-v1.5
-EMBEDDING_BACKEND=auto
-EMBEDDING_DEVICE=auto
+EMBEDDING_BACKEND=torch
+EMBEDDING_DEVICE=cpu
 RERANKER_ENABLED=true
 RERANKER_MODEL=BAAI/bge-reranker-base
 RERANKER_DEVICE=auto
@@ -216,8 +231,8 @@ AGENT_MAX_DURATION_SECONDS=90
 
 Embedding runtime selection:
 
-- `EMBEDDING_BACKEND=auto` will prefer Intel GPU via OpenVINO when available, otherwise fall back to Torch
-- `EMBEDDING_DEVICE=auto` will prefer Intel GPU, then Nvidia CUDA, then CPU
+- default runtime is `EMBEDDING_BACKEND=torch` + `EMBEDDING_DEVICE=cpu` for stable indexing and serving
+- if you want to experiment with GPU later, override explicitly instead of relying on auto-detection
 - explicit override examples:
   - `EMBEDDING_BACKEND=openvino` + `EMBEDDING_DEVICE=gpu`
   - `EMBEDDING_BACKEND=torch` + `EMBEDDING_DEVICE=cuda`

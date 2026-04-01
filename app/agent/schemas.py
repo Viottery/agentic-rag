@@ -8,10 +8,43 @@ class TaskItem(BaseModel):
 
     task_id: str = Field(..., description="子任务唯一 ID")
     task_type: Literal["rag", "search", "action"] = Field(
-        ...,
+        default="rag",
         description="子任务类型",
     )
     question: str = Field(..., description="交给子 agent 执行的问题")
+    executor: str = Field(
+        default="",
+        description="执行该子任务的 skill / executor 名称；若留空则由运行时根据 task_type 推断。",
+    )
+    success_criteria: str = Field(
+        default="",
+        description="该子任务完成后应满足的简短成功标准。",
+    )
+
+
+class FastPathDecision(BaseModel):
+    """fast gate 的分流决策。"""
+
+    mode: Literal["direct_answer", "single_skill", "planner_loop"] = Field(
+        ...,
+        description="当前请求应走的主路径。",
+    )
+    reason: str = Field(
+        default="",
+        description="为什么这样分流。",
+    )
+    executor: str = Field(
+        default="",
+        description="当 mode=single_skill 时，直接执行的 skill 名称。",
+    )
+    question: str = Field(
+        default="",
+        description="当 mode=single_skill 时，交给该 skill 的任务问题。",
+    )
+    success_criteria: str = Field(
+        default="",
+        description="single_skill 路径下的成功标准。",
+    )
 
 
 class PlannerDecision(BaseModel):

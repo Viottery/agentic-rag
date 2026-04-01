@@ -22,6 +22,48 @@ class EvidenceItem(TypedDict, total=False):
     metadata: Dict[str, Any]
 
 
+class FastPathDecisionState(TypedDict, total=False):
+    """fast gate 的运行时决策。"""
+
+    mode: Literal["direct_answer", "single_skill", "planner_loop"]
+    reason: str
+    executor: str
+    question: str
+    success_criteria: str
+
+
+class SkillResult(TypedDict, total=False):
+    """单次 skill 执行后的结构化结果。"""
+
+    task_id: str
+    executor: str
+    status: Literal["done", "failed"]
+    summary: str
+    evidence_count: int
+    source_count: int
+    error: str
+
+
+class ExecutionResult(TypedDict, total=False):
+    """单次 execution agent 运行后的结构化结果。"""
+
+    task_id: str
+    executor: str
+    status: Literal["done", "failed"]
+    summary: str
+    evidence_count: int
+    source_count: int
+    error: str
+    evidence: List["EvidenceItem"]
+    sources: List[str]
+    retrieved_docs: List[str]
+    retrieved_sources: List[str]
+    used_tools: List[str]
+    degraded: bool
+    degraded_reason: str
+    trace: List["AgentStep"]
+
+
 class CitationItem(TypedDict, total=False):
     """答案段落映射出的引用项。"""
 
@@ -41,7 +83,9 @@ class SubTask(TypedDict, total=False):
 
     task_id: str
     task_type: Literal["rag", "search", "action"]
+    executor: str
     question: str
+    success_criteria: str
     status: Literal["pending", "running", "done", "failed"]
     result: str
     evidence: List[EvidenceItem]
@@ -104,11 +148,14 @@ class AgentState(TypedDict):
     messages: List[Dict[str, Any]]
 
     # planner / orchestration
+    fast_path_decision: FastPathDecisionState
     thought: str
     subtasks: List[SubTask]
     planner_control: PlannerControl
     current_task: SubTask
     intermediate_steps: List[AgentStep]
+    execution_results: List[ExecutionResult]
+    skill_results: List[SkillResult]
 
     # aggregated execution context
     kb_structure_summary: str
@@ -138,4 +185,33 @@ class AgentState(TypedDict):
 
     # final output
     answer: str
+    status: str
+
+
+class SubtaskState(TypedDict):
+    """
+    execution agent 的子任务运行态。
+
+    该状态只覆盖单个原子任务的执行图，方便未来单独调度、
+    单独持久化，或切换到异步调用。
+    """
+
+    question: str
+    thought: str
+    current_task: SubTask
+    subtasks: List[SubTask]
+    intermediate_steps: List[AgentStep]
+    kb_structure_summary: str
+    aggregated_context: str
+    evidence: List[EvidenceItem]
+    retrieved_docs: List[str]
+    retrieved_sources: List[str]
+    used_tools: List[str]
+    observation: str
+    error: str
+    started_at: str
+    started_at_ts: float
+    finished_at: str
+    max_duration_seconds: int
+    execution_result: ExecutionResult
     status: str
