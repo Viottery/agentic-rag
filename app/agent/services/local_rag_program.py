@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from app.agent import nodes
 from app.agent.state_factory import build_initial_agent_state, build_subtask_initial_state
+from app.runtime.conversation_store import get_conversation_store
 
 
 class LocalRAGProgramRequest(BaseModel):
@@ -101,11 +102,19 @@ def _to_response(state: dict[str, Any]) -> LocalRAGProgramResponse:
 
 
 def run_local_rag_program(request: LocalRAGProgramRequest) -> LocalRAGProgramResponse:
+    context_bundle = get_conversation_store().load_context_bundle(
+        request.conversation_id,
+        request.question,
+    )
     parent_state = build_initial_agent_state(
         request.question,
         max_iterations=1,
         max_duration_seconds=request.max_duration_seconds,
         conversation_id=request.conversation_id,
+        messages=context_bundle.messages,
+        conversation_summary=context_bundle.conversation_summary,
+        recent_turn_summaries=context_bundle.recent_turn_summaries,
+        memory_notes=context_bundle.memory_notes,
     )
     subtask_state = build_subtask_initial_state(
         parent_state,
@@ -118,11 +127,20 @@ def run_local_rag_program(request: LocalRAGProgramRequest) -> LocalRAGProgramRes
 
 
 async def run_local_rag_program_async(request: LocalRAGProgramRequest) -> LocalRAGProgramResponse:
+    context_bundle = await asyncio.to_thread(
+        get_conversation_store().load_context_bundle,
+        request.conversation_id,
+        request.question,
+    )
     parent_state = build_initial_agent_state(
         request.question,
         max_iterations=1,
         max_duration_seconds=request.max_duration_seconds,
         conversation_id=request.conversation_id,
+        messages=context_bundle.messages,
+        conversation_summary=context_bundle.conversation_summary,
+        recent_turn_summaries=context_bundle.recent_turn_summaries,
+        memory_notes=context_bundle.memory_notes,
     )
     subtask_state = build_subtask_initial_state(
         parent_state,

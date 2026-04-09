@@ -18,6 +18,7 @@ The next practical goal is not to hardcode more fixed graph branches, and also n
 - `conversation` is the primary context boundary
 - `shell` is the primary execution substrate
 - `skill registry` provides organized invocation knowledge and prompt packaging
+- `capability registry` normalizes local tools, services, shell adapters, and future MCP-backed abilities
 - `service/API` provides the real capability, such as local RAG, search, or future tools
 
 In the near term, this means:
@@ -75,6 +76,8 @@ Current design characteristics:
 Important design notes:
 
 - skills should be stable descriptors, not service implementations
+- model output should prefer structured tool or capability intents; runtime owns validation, policy, execution, and result writeback
+- MCP should be treated as another capability source behind the same runtime protocol, not as a planner-visible special case
 - planner may know skill metadata, but should not directly call skills or compose shell commands
 - execution agents should preserve strong command-line ability
 - cross-platform support should come from platform-aware invocation templates, not by flattening Linux and Windows into one shell model
@@ -86,6 +89,7 @@ More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/hom
 - [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md): target runtime architecture, planner and execution-agent boundaries, skill registry, service/API split, shell-first execution, and shell policy
 - [docs/context-memory-architecture.md](/home/viottery/workspace/agentic-rag/docs/context-memory-architecture.md): conversation model, short-term and long-term memory layers, trace recording, conversation queues, and async runtime boundaries
 - [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): staged migration plan for fast gate, execution-agent runtime, skill registry, service-ization, cross-platform CLI invocation, and shell risk control
+- [docs/capability-protocol-and-skills.md](/home/viottery/workspace/agentic-rag/docs/capability-protocol-and-skills.md): unified tool invocation protocol, MCP as a capability source, and skill semantics as prompt/workflow descriptors rather than executors
 - [docs/agent-product-gap-analysis.md](/home/viottery/workspace/agentic-rag/docs/agent-product-gap-analysis.md): product-level reasons for moving from node-heavy orchestration to shell-first execution agents plus service-backed capabilities
 
 ## Runtime Strategy

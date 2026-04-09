@@ -149,6 +149,9 @@ class AgentState(TypedDict):
     job_id: str
     question: str
     messages: List[Dict[str, Any]]
+    conversation_summary: str
+    recent_turn_summaries: List[str]
+    memory_notes: List[str]
 
     # planner / orchestration
     fast_path_decision: FastPathDecisionState

@@ -128,3 +128,24 @@ class RAGRoutePlan(BaseModel):
         default="",
         description="简短说明为什么这样选择检索范围",
     )
+
+
+class ToolExecutionPlan(BaseModel):
+    """action 节点的结构化执行计划。"""
+
+    mode: Literal["shell", "respond", "reject"] = Field(
+        ...,
+        description="执行模式：shell、直接返回文本，或拒绝执行。",
+    )
+    command: str = Field(
+        default="",
+        description="当 mode=shell 时执行的 shell 命令。",
+    )
+    response_text: str = Field(
+        default="",
+        description="当 mode=respond 或 reject 时返回给上层的文本。",
+    )
+    rationale: str = Field(
+        default="",
+        description="为什么这样执行。",
+    )

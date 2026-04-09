@@ -2,6 +2,14 @@
 
 本文档用于整理 Agentic-RAG 下一阶段的发展方向。
 
+与响应速度和首 token 相关的专项分析见：
+
+- [docs/first-token-and-latency-optimization.md](/home/viottery/workspace/agentic-rag/docs/first-token-and-latency-optimization.md)
+
+与 tool / MCP / skill 统一边界相关的专项分析见：
+
+- [docs/capability-protocol-and-skills.md](/home/viottery/workspace/agentic-rag/docs/capability-protocol-and-skills.md)
+
 当前 roadmap 的核心变化是：
 
 - 不再围绕旧的固定节点链继续加复杂度
@@ -276,6 +284,18 @@ planner / execution / validator 的输出应被记录，
 - memory note 写入
 
 ## 5. Skill Registry
+
+在 skill registry 继续细化之前，
+需要先明确一个更底层的 runtime 原则：
+
+- 模型输出应尽量收敛为结构化 `tool intent`
+- runtime 通过统一 capability protocol 负责查找、校验、授权与执行
+- `MCP` 与本地 tool / service 一样，属于 capability source
+- `skill` 则保留为 prompt / workflow / invocation knowledge layer
+
+这条边界的专项设计见：
+
+- [docs/capability-protocol-and-skills.md](/home/viottery/workspace/agentic-rag/docs/capability-protocol-and-skills.md)
 
 ### 3.1 为什么要引入 skill registry
 

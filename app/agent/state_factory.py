@@ -15,6 +15,10 @@ def build_initial_agent_state(
     conversation_id: str = "",
     turn_id: str = "",
     job_id: str = "",
+    messages: list[dict] | None = None,
+    conversation_summary: str = "",
+    recent_turn_summaries: list[str] | None = None,
+    memory_notes: list[str] | None = None,
 ) -> AgentState:
     """构造 /chat 主图的初始运行态。"""
     started_at_ts = time.time()
@@ -26,7 +30,10 @@ def build_initial_agent_state(
         "turn_id": turn_id,
         "job_id": job_id,
         "question": question,
-        "messages": [],
+        "messages": list(messages or []),
+        "conversation_summary": conversation_summary,
+        "recent_turn_summaries": list(recent_turn_summaries or []),
+        "memory_notes": list(memory_notes or []),
 
         # planner / orchestration
         "fast_path_decision": {

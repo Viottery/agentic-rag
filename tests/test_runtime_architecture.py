@@ -67,6 +67,9 @@ def _base_state(question: str) -> dict:
             "question": "",
             "success_criteria": "",
         },
+        "conversation_summary": "",
+        "recent_turn_summaries": [],
+        "memory_notes": [],
         "thought": "",
         "subtasks": [],
         "planner_control": {
@@ -285,6 +288,57 @@ def test_subtask_graph_routes_are_executor_specific() -> None:
     assert subtask_graph_module.route_after_query_refiner(
         {"current_task": {"task_type": "search", "executor": "web_search_retrieve"}}
     ) == "search_agent"
+
+
+def test_action_agent_executes_shell_runtime_when_plan_requests_shell(monkeypatch) -> None:
+    state = _base_state("请执行一个简单操作：把字符串 'agentic rag' 转成大写并返回结果。")
+    state["current_task"] = {
+        "task_id": "a1",
+        "task_type": "action",
+        "executor": "tool_execute",
+        "question": "把字符串 'agentic rag' 转成大写并返回结果。",
+        "success_criteria": "返回转换结果",
+        "status": "running",
+        "result": "",
+        "evidence": [],
+        "sources": [],
+        "error": "",
+    }
+    state["subtasks"] = [state["current_task"]]
+
+    monkeypatch.setattr(
+        nodes_module,
+        "_plan_tool_execution",
+        lambda _state: types.SimpleNamespace(
+            mode="shell",
+            command="python - <<'PY'\nprint('AGENTIC RAG')\nPY",
+            response_text="",
+            rationale="deterministic shell transform",
+        ),
+    )
+    monkeypatch.setattr(
+        nodes_module,
+        "run_shell_command",
+        lambda _command: types.SimpleNamespace(
+            allowed=True,
+            command="python - <<'PY' print('AGENTIC RAG') PY",
+            cwd="/tmp",
+            exit_code=0,
+            stdout="AGENTIC RAG\n",
+            stderr="",
+            duration_seconds=0.01,
+            risk_level="low",
+            policy_reason="allowed",
+            truncated=False,
+        ),
+    )
+
+    updated = nodes_module.action_agent(state)
+
+    assert updated["current_task"]["status"] == "done"
+    assert updated["current_task"]["degraded"] is False
+    assert updated["used_tools"][-1] == "shell_runtime"
+    assert "AGENTIC RAG" in updated["current_task"]["result"]
 
 
 def test_graph_routes_use_main_and_subtask_boundaries() -> None:

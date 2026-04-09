@@ -3,16 +3,59 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal, Protocol
 from uuid import uuid4
 
-from app.agent.graph import async_main_agent_graph, main_agent_graph
-from app.agent.state_factory import build_initial_agent_state
 from app.core.config import get_settings
+from app.runtime.conversation_store import ConversationContextBundle, get_conversation_store
 
 
 JobStatus = Literal["queued", "running", "finished", "failed"]
 TurnRunner = Callable[[str, str, str, str], Awaitable[dict[str, Any]]]
+
+
+class ConversationStoreLike(Protocol):
+    def load_context_bundle(
+        self,
+        conversation_id: str,
+        query: str = "",
+    ) -> ConversationContextBundle: ...
+
+    def save_turn_result(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        job_id: str,
+        question: str,
+        result: dict[str, Any],
+    ) -> None: ...
+
+
+class _NullConversationStore:
+    def load_context_bundle(
+        self,
+        conversation_id: str,
+        query: str = "",
+    ) -> ConversationContextBundle:
+        return ConversationContextBundle(
+            conversation_id=conversation_id.strip(),
+            messages=[],
+            conversation_summary="",
+            recent_turn_summaries=[],
+            memory_notes=[],
+        )
+
+    def save_turn_result(
+        self,
+        *,
+        conversation_id: str,
+        turn_id: str,
+        job_id: str,
+        question: str,
+        result: dict[str, Any],
+    ) -> None:
+        return None
 
 
 def _iso_now() -> str:
@@ -25,7 +68,16 @@ async def _default_turn_runner(
     turn_id: str,
     job_id: str,
 ) -> dict[str, Any]:
+    from app.agent.graph import async_main_agent_graph, main_agent_graph
+    from app.agent.state_factory import build_initial_agent_state
+
     settings = get_settings()
+    store = get_conversation_store()
+    context_bundle = await asyncio.to_thread(
+        store.load_context_bundle,
+        conversation_id,
+        question,
+    )
     initial_state = build_initial_agent_state(
         question,
         max_iterations=settings.agent_max_iterations,
@@ -33,6 +85,10 @@ async def _default_turn_runner(
         conversation_id=conversation_id,
         turn_id=turn_id,
         job_id=job_id,
+        messages=context_bundle.messages,
+        conversation_summary=context_bundle.conversation_summary,
+        recent_turn_summaries=context_bundle.recent_turn_summaries,
+        memory_notes=context_bundle.memory_notes,
     )
 
     if hasattr(async_main_agent_graph, "ainvoke"):
@@ -89,8 +145,10 @@ class ConversationQueueManager:
         *,
         runner: TurnRunner | None = None,
         max_concurrent_conversations: int = 4,
+        store: ConversationStoreLike | None = None,
     ) -> None:
         self._runner = runner or _default_turn_runner
+        self._store = store or _NullConversationStore()
         self._conversation_locks: dict[str, asyncio.Lock] = {}
         self._jobs: dict[str, ConversationJob] = {}
         self._semaphore = asyncio.Semaphore(max(1, max_concurrent_conversations))
@@ -144,6 +202,14 @@ class ConversationQueueManager:
                         job.turn_id,
                         job.job_id,
                     )
+                    await asyncio.to_thread(
+                        self._store.save_turn_result,
+                        conversation_id=job.conversation_id,
+                        turn_id=job.turn_id,
+                        job_id=job.job_id,
+                        question=job.question,
+                        result=result,
+                    )
                     job.result = {
                         **result,
                         "conversation_id": job.conversation_id,
@@ -154,6 +220,21 @@ class ConversationQueueManager:
                 except Exception as exc:  # noqa: BLE001
                     job.error = str(exc)
                     job.status = "failed"
+                    await asyncio.to_thread(
+                        self._store.save_turn_result,
+                        conversation_id=job.conversation_id,
+                        turn_id=job.turn_id,
+                        job_id=job.job_id,
+                        question=job.question,
+                        result={
+                            "status": "failed",
+                            "error": job.error,
+                            "started_at": job.started_at,
+                            "finished_at": _iso_now(),
+                            "intermediate_steps": [],
+                            "trace_summary": "",
+                        },
+                    )
                 finally:
                     job.finished_at = _iso_now()
 
@@ -167,5 +248,6 @@ def get_conversation_queue_manager() -> ConversationQueueManager:
         settings = get_settings()
         _MANAGER = ConversationQueueManager(
             max_concurrent_conversations=settings.agent_max_concurrent_conversations,
+            store=get_conversation_store(),
         )
     return _MANAGER
