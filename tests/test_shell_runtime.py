@@ -21,6 +21,7 @@ from app.runtime.shell_runtime import (
 def _settings(**overrides):
     values = {
         "shell_runtime_enabled": True,
+        "shell_provider": "bash",
         "shell_program": "bash",
         "shell_policy_mode": "workspace-write",
         "shell_workspace_root": str(Path.cwd()),
@@ -216,3 +217,41 @@ def test_shell_runtime_executes_destructive_command_after_approval(monkeypatch, 
     assert str(target) in (result.touched_paths or [])
     assert not target.exists()
     assert get_pending_shell_approval(pending.approval_id) is None
+
+
+def test_shell_runtime_requires_approval_for_powershell_destructive_command(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "notes.txt"
+    target.write_text("keep me", encoding="utf-8")
+    monkeypatch.setattr(
+        shell_runtime_module,
+        "get_settings",
+        lambda: _settings(shell_workspace_root=str(workspace)),
+    )
+
+    result = run_shell_command("Remove-Item notes.txt", cwd=str(workspace))
+
+    assert result.allowed is False
+    assert result.exit_code == -3
+    assert result.approval_required is True
+    assert "destructive_command" in (result.policy_violations or [])
+    assert str(target) in (result.touched_paths or [])
+    assert target.exists()
+    assert reject_shell_approval(result.approval_id) is True
+
+
+def test_shell_runtime_blocks_powershell_admin_elevation(monkeypatch, tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(
+        shell_runtime_module,
+        "get_settings",
+        lambda: _settings(shell_workspace_root=str(workspace)),
+    )
+
+    result = run_shell_command("Start-Process powershell -Verb RunAs", cwd=str(workspace))
+
+    assert result.allowed is False
+    assert result.exit_code == -1
+    assert "dangerous_pattern" in (result.policy_violations or [])

@@ -17,6 +17,7 @@ from app.agent.services.local_rag_program import (
 from app.agent.llm import get_chat_model
 from app.core.config import get_settings
 from app.rag.inference_runtime import ensure_local_model_runtime
+from app.runtime.platform import LocalRAGEndpoint, build_local_rag_endpoint
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,13 @@ class _QueuedRetrieveRequest:
 class LocalRAGSocketService:
     def __init__(self) -> None:
         settings = get_settings()
-        self._socket_path = Path(settings.local_rag_socket_path)
+        self._endpoint: LocalRAGEndpoint = build_local_rag_endpoint(
+            transport=settings.local_rag_transport,
+            socket_path=settings.local_rag_socket_path,
+            host=settings.local_rag_host,
+            port=settings.local_rag_port,
+        )
+        self._socket_path = self._endpoint.socket_path
         self._retrieve_worker_count = max(1, settings.local_rag_retrieve_workers)
         self._retrieve_queue: asyncio.Queue[_QueuedRetrieveRequest | None] = asyncio.Queue()
         self._retrieve_workers: list[asyncio.Task[None]] = []
@@ -44,6 +51,10 @@ class LocalRAGSocketService:
         return self._socket_path
 
     @property
+    def endpoint(self) -> LocalRAGEndpoint:
+        return self._endpoint
+
+    @property
     def started(self) -> bool:
         return self._started
 
@@ -51,9 +62,10 @@ class LocalRAGSocketService:
         if self._started:
             return
 
-        self._socket_path.parent.mkdir(parents=True, exist_ok=True)
-        if self._socket_path.exists():
-            self._socket_path.unlink()
+        if self._endpoint.transport == "unix":
+            self._socket_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._socket_path.exists():
+                self._socket_path.unlink()
 
         await asyncio.to_thread(get_chat_model)
         await self._runtime.start()
@@ -61,14 +73,22 @@ class LocalRAGSocketService:
             asyncio.create_task(self._retrieve_worker(index))
             for index in range(self._retrieve_worker_count)
         ]
-        self._server = await asyncio.start_unix_server(
-            self._handle_connection,
-            path=str(self._socket_path),
-        )
+        if self._endpoint.transport == "tcp":
+            self._server = await asyncio.start_server(
+                self._handle_connection,
+                host=self._endpoint.host,
+                port=self._endpoint.port,
+            )
+        else:
+            self._server = await asyncio.start_unix_server(
+                self._handle_connection,
+                path=str(self._socket_path),
+            )
         self._started = True
         logger.warning(
-            "LocalRAGSocketService started at %s with %s retrieve workers.",
-            self._socket_path,
+            "LocalRAGSocketService started via %s at %s with %s retrieve workers.",
+            self._endpoint.transport,
+            self._endpoint_display(),
             self._retrieve_worker_count,
         )
 
@@ -90,9 +110,14 @@ class LocalRAGSocketService:
 
         await self._runtime.stop()
 
-        if self._socket_path.exists():
+        if self._endpoint.transport == "unix" and self._socket_path.exists():
             self._socket_path.unlink()
         self._started = False
+
+    def _endpoint_display(self) -> str:
+        if self._endpoint.transport == "tcp":
+            return f"{self._endpoint.host}:{self._endpoint.port}"
+        return str(self._socket_path)
 
     async def submit(self, request: LocalRAGProgramRequest) -> LocalRAGProgramResponse:
         if not self._started:
@@ -132,7 +157,10 @@ class LocalRAGSocketService:
                 response = {
                     "ok": True,
                     "status": "ok",
+                    "transport": self._endpoint.transport,
                     "socket_path": str(self._socket_path),
+                    "host": self._endpoint.host,
+                    "port": self._endpoint.port,
                     "runtime_started": self._runtime.started,
                 }
             elif command == "retrieve":

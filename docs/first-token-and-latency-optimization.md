@@ -74,15 +74,14 @@
 这意味着即便 graph 结构本身合理，
 也会因为“回答生成与返回太晚”而造成明显迟滞。
 
-### 2.3 本地 RAG 热路径还有额外的 shell hop
+### 2.3 本地 RAG 热路径还有额外的 subprocess hop
 
-当前 [app/agent/services/local_rag_shell_client.py](../app/agent/services/local_rag_shell_client.py)
+当前 [app/agent/services/local_rag_process_client.py](../app/agent/services/local_rag_process_client.py)
 会在服务内热路径上执行：
 
-- `bash -lc`
 - 临时 `request.json`
-- 子 Python 进程
-- 再由客户端走 unix socket 调用本地 RAG 服务
+- 直接子 Python 进程
+- 再由客户端走本地 RAG 服务 endpoint 调用
 - 临时 `response.json` 回传
 
 这条链路适合做解耦和兼容，
@@ -306,23 +305,23 @@ simple local kb ask
   -> answer
 ```
 
-### 4.4 去掉默认热路径中的 shell 子进程 hop
+### 4.4 去掉默认热路径中的子进程 hop
 
 对应用内 `/chat` 路径，
 建议把默认调用改成：
 
 - app process
   -> in-process local rag client
-  -> unix socket service
+  -> local RAG service endpoint
 
 而不是：
 
 - app process
-  -> `bash -lc`
+  -> subprocess client
   -> child python client
-  -> unix socket service
+  -> local RAG service endpoint
 
-shell 包装可以保留作为：
+subprocess 包装可以保留作为：
 
 - 调试路径
 - CLI 兼容路径
@@ -424,7 +423,7 @@ shell 包装可以保留作为：
 建议优先做：
 
 1. 为简单 local KB ask 建立 direct retrieve fast path
-2. 去掉默认热路径中的 `bash -lc` local rag hop
+2. 去掉默认热路径中的 local rag subprocess hop
 3. 建立 conversation-scoped context cache
 4. 稳定 prompt prefix 与 skill/tool 顺序
 

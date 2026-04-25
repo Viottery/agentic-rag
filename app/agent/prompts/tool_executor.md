@@ -29,8 +29,8 @@ Return only the structured fields required by the schema:
 - Never use `sudo`.
 - Never generate destructive commands such as deleting system files, formatting disks, rebooting, or remote-access commands.
 - Prefer deterministic commands.
-- When a short transformation is needed, using `python - <<'PY' ... PY` is acceptable.
-- Assume the runtime will execute on Linux with `bash`.
+- When a short transformation is needed, prefer a `python -c` command or a platform-neutral project CLI when practical.
+- Do not assume a fixed shell. The runtime chooses the configured provider, typically `bash` on Linux and PowerShell on Windows.
 
 # Safety
 

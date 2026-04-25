@@ -82,6 +82,14 @@ Important design notes:
 - execution agents should preserve strong command-line ability
 - cross-platform support should come from platform-aware invocation templates, not by flattening Linux and Windows into one shell model
 
+Current cross-platform runtime defaults:
+
+- `SHELL_PROVIDER=auto`: resolves to `bash` outside Windows and PowerShell on Windows
+- `SHELL_PROGRAM`: optional explicit executable override for the selected provider
+- `SHELL_WORKSPACE_ROOT`: optional workspace root override; defaults to the current working directory
+- `LOCAL_RAG_TRANSPORT=auto`: resolves to Unix socket outside Windows and TCP on Windows
+- `LOCAL_RAG_HOST` / `LOCAL_RAG_PORT`: TCP endpoint used by the local RAG service when TCP transport is selected
+
 More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/home/viottery/workspace/agentic-rag/docs/langgraph-workflow-visualization.md).
 
 ## Docs

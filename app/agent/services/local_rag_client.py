@@ -7,14 +7,21 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import get_settings
+from app.runtime.platform import build_local_rag_endpoint
 
 
 async def _send_envelope(
     envelope: dict[str, Any],
     *,
+    transport: str,
     socket_path: str,
+    host: str,
+    port: int,
 ) -> dict[str, Any]:
-    reader, writer = await asyncio.open_unix_connection(socket_path)
+    if transport == "tcp":
+        reader, writer = await asyncio.open_connection(host, port)
+    else:
+        reader, writer = await asyncio.open_unix_connection(socket_path)
     writer.write((json.dumps(envelope, ensure_ascii=False) + "\n").encode("utf-8"))
     await writer.drain()
     raw_line = await reader.readline()
@@ -28,28 +35,53 @@ async def _send_envelope(
 async def invoke_local_rag_client(
     payload: dict[str, Any],
     *,
+    transport: str | None = None,
     socket_path: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
 ) -> dict[str, Any]:
     settings = get_settings()
-    resolved_socket_path = socket_path or settings.local_rag_socket_path
+    endpoint = build_local_rag_endpoint(
+        transport=transport or settings.local_rag_transport,
+        socket_path=socket_path or settings.local_rag_socket_path,
+        host=host or settings.local_rag_host,
+        port=port or settings.local_rag_port,
+    )
     response = await _send_envelope(
         {
             "command": "retrieve",
             "payload": payload,
         },
-        socket_path=resolved_socket_path,
+        transport=endpoint.transport,
+        socket_path=str(endpoint.socket_path),
+        host=endpoint.host,
+        port=endpoint.port,
     )
     if not response.get("ok", False):
         raise RuntimeError(str(response.get("error", "local rag service failed")))
     return dict(response.get("result", {}))
 
 
-async def health_local_rag_client(*, socket_path: str | None = None) -> dict[str, Any]:
+async def health_local_rag_client(
+    *,
+    transport: str | None = None,
+    socket_path: str | None = None,
+    host: str | None = None,
+    port: int | None = None,
+) -> dict[str, Any]:
     settings = get_settings()
-    resolved_socket_path = socket_path or settings.local_rag_socket_path
+    endpoint = build_local_rag_endpoint(
+        transport=transport or settings.local_rag_transport,
+        socket_path=socket_path or settings.local_rag_socket_path,
+        host=host or settings.local_rag_host,
+        port=port or settings.local_rag_port,
+    )
     response = await _send_envelope(
         {"command": "health"},
-        socket_path=resolved_socket_path,
+        transport=endpoint.transport,
+        socket_path=str(endpoint.socket_path),
+        host=endpoint.host,
+        port=endpoint.port,
     )
     if not response.get("ok", False):
         raise RuntimeError(str(response.get("error", "local rag service failed")))
@@ -63,10 +95,16 @@ def build_parser() -> argparse.ArgumentParser:
     invoke_parser = subparsers.add_parser("invoke", help="Invoke local rag service")
     invoke_parser.add_argument("--request-file", required=True, help="Path to request JSON")
     invoke_parser.add_argument("--output-file", default="", help="Path to response JSON")
+    invoke_parser.add_argument("--transport", default="", choices=["", "auto", "unix", "tcp"], help="Override local rag transport")
     invoke_parser.add_argument("--socket-path", default="", help="Override local rag socket path")
+    invoke_parser.add_argument("--host", default="", help="Override local rag TCP host")
+    invoke_parser.add_argument("--port", type=int, default=0, help="Override local rag TCP port")
 
     health_parser = subparsers.add_parser("health", help="Check local rag service health")
+    health_parser.add_argument("--transport", default="", choices=["", "auto", "unix", "tcp"], help="Override local rag transport")
     health_parser.add_argument("--socket-path", default="", help="Override local rag socket path")
+    health_parser.add_argument("--host", default="", help="Override local rag TCP host")
+    health_parser.add_argument("--port", type=int, default=0, help="Override local rag TCP port")
     return parser
 
 
@@ -88,7 +126,12 @@ def main() -> int:
 
     if args.command == "health":
         response = asyncio.run(
-            health_local_rag_client(socket_path=args.socket_path or None),
+            health_local_rag_client(
+                transport=args.transport or None,
+                socket_path=args.socket_path or None,
+                host=args.host or None,
+                port=args.port or None,
+            ),
         )
         _write_payload(response, None)
         return 0
@@ -97,7 +140,10 @@ def main() -> int:
     result = asyncio.run(
         invoke_local_rag_client(
             payload,
+            transport=args.transport or None,
             socket_path=args.socket_path or None,
+            host=args.host or None,
+            port=args.port or None,
         )
     )
     _write_payload(result, args.output_file or None)

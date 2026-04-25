@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-import asyncio
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import re
 import shlex
-import subprocess
 import threading
 import time
 from uuid import uuid4
 
 from app.core.config import get_settings
+from app.runtime.platform import default_workspace_root, is_windows
+from app.runtime.process_runner import arun_process, run_process
+from app.runtime.shell_providers import resolve_shell_provider
 
 
 _READ_ONLY_PREFIXES = (
@@ -28,12 +29,17 @@ _READ_ONLY_PREFIXES = (
     "git status",
     "git diff",
     "git show",
+    "get-location",
+    "get-childitem",
+    "get-content",
+    "select-string",
     "python -m pytest",
     "pytest",
 )
 
 _WRITE_COMMAND_PATTERNS = (
     r"(^|[\s;&|])(touch|mkdir|cp|mv|tee|chmod|chown|truncate)\b",
+    r"(^|[\s;&|])(new-item|set-content|add-content|copy-item|move-item|rename-item|out-file)\b",
     r"(^|[\s;&|])sed\s+[^;&|]*\s-i(\s|$)",
     r"(^|[\s;&|])python(3)?\b.*\b(open|write_text|write_bytes|mkdir|touch|rename|replace)\s*\(",
     r"(^|[\s;&|])python(3)?\b.*\b(shutil\.copy|shutil\.move|Path\s*\()",
@@ -45,14 +51,17 @@ _DESTRUCTIVE_PATTERNS = (
     r"(^|[\s;&|])rm(\s|$)",
     r"(^|[\s;&|])rmdir(\s|$)",
     r"(^|[\s;&|])shred(\s|$)",
+    r"(^|[\s;&|])(remove-item|del|erase|rd|ri)\b",
     r"(^|[\s;&|])git\s+(reset|clean|restore)\b",
 )
 
 _DANGEROUS_PATTERNS = (
     r"(^|[\s;&|])sudo(\s|$)",
+    r"(^|[\s;&|])start-process\b.*-verb\s+runas\b",
     r"rm\s+-rf\s+/",
     r"mkfs(\.| )",
     r"(^|[\s;&|])(shutdown|reboot|halt|poweroff)(\s|$)",
+    r"(^|[\s;&|])(restart-computer|stop-computer|format-volume|clear-disk)(\s|$)",
     r"dd\s+if=",
     r"(:\(\)\s*\{\s*:\|\:&\s*\};:)",
     r"curl\b[^|]*\|\s*(sh|bash)",
@@ -65,22 +74,38 @@ _DANGEROUS_PATTERNS = (
 
 _REDIRECTION_PATTERN = re.compile(r"(?<![<>])(?:>>?|[12]>>?|&>)\s*([^\s;&|]+)")
 _QUOTED_PATH_PATTERN = re.compile(
-    r"(?P<quote>['\"])(?P<path>/[^'\"]+|\.\.?/[^'\"]+|[A-Za-z0-9_.-]+/[^'\"]+)(?P=quote)"
+    r"(?P<quote>['\"])(?P<path>[A-Za-z]:[\\/][^'\"]+|\\\\[^'\"]+|/[^'\"]+|\.\.?[\\/][^'\"]+|[A-Za-z0-9_.-]+[\\/][^'\"]+)(?P=quote)"
 )
 _PYTHON_PATH_ARG_PATTERN = re.compile(
     r"\b(?:Path|open)\s*\(\s*(?P<quote>['\"])(?P<path>[^'\"]+)(?P=quote)"
 )
 _BARE_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.-])/(?:[^\s;&|`'\"<>])+")
+_BARE_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w.-])(?:[A-Za-z]:[\\/]|\\\\[^\\/\s;&|`'\"<>]+[\\/])(?:[^\s;&|`'\"<>])+"
+)
 _COMMANDS_WITH_BARE_PATH_ARGS = {
     "rm",
     "rmdir",
     "shred",
+    "remove-item",
+    "del",
+    "erase",
+    "rd",
+    "ri",
     "touch",
     "mkdir",
     "cp",
     "mv",
     "tee",
     "truncate",
+    "new-item",
+    "set-content",
+    "add-content",
+    "copy-item",
+    "move-item",
+    "rename-item",
+    "out-file",
+    "get-content",
 }
 
 
@@ -143,11 +168,7 @@ def _split_csv_paths(value: str) -> list[str]:
 
 def _resolve_workspace_root() -> Path:
     settings = get_settings()
-    configured = str(settings.shell_workspace_root or "").strip()
-    candidate = Path(configured) if configured else Path.cwd()
-    if not candidate.exists() and configured == "/workspace":
-        candidate = Path.cwd()
-    return candidate.resolve()
+    return default_workspace_root(settings.shell_workspace_root)
 
 
 def _allowed_roots(workspace_root: Path) -> list[Path]:
@@ -191,7 +212,10 @@ def _looks_like_path(token: str) -> bool:
         or token.startswith(".")
         or token.startswith("./")
         or token.startswith("../")
+        or token.startswith("\\\\")
+        or re.match(r"^[A-Za-z]:[\\/]", token) is not None
         or "/" in token
+        or "\\" in token
     )
 
 
@@ -209,16 +233,21 @@ def _resolve_command_path(token: str, *, cwd: Path, force: bool = False) -> Path
     return (path if path.is_absolute() else cwd / path).resolve()
 
 
+def _split_command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command, posix=not is_windows())
+    except ValueError:
+        return command.split()
+
+
 def _extract_path_references(command: str, *, cwd: Path) -> list[Path]:
     candidates: list[str] = []
 
-    try:
-        candidates.extend(shlex.split(command, posix=True))
-    except ValueError:
-        candidates.extend(command.split())
+    candidates.extend(_split_command_tokens(command))
 
     candidates.extend(match.group("path") for match in _QUOTED_PATH_PATTERN.finditer(command))
     candidates.extend(match.group(0) for match in _BARE_ABSOLUTE_PATH_PATTERN.finditer(command))
+    candidates.extend(match.group(0) for match in _BARE_WINDOWS_ABSOLUTE_PATH_PATTERN.finditer(command))
     resolved: list[Path] = []
     seen: set[str] = set()
     for token in candidates:
@@ -251,13 +280,10 @@ def _extract_path_references(command: str, *, cwd: Path) -> list[Path]:
 
 
 def _bare_path_args(command: str, *, cwd: Path) -> list[Path]:
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return []
+    tokens = _split_command_tokens(command)
     if not tokens:
         return []
-    command_name = Path(tokens[0]).name
+    command_name = Path(tokens[0]).name.lower()
     if command_name not in _COMMANDS_WITH_BARE_PATH_ARGS:
         return []
 
@@ -512,37 +538,18 @@ def run_shell_command(
             approval_expires_at_ts=approval_request.expires_at_ts if approval_request else 0.0,
         )
 
-    started_at = time.time()
-    try:
-        completed = subprocess.run(
-            [settings.shell_program, "-lc", command],
-            cwd=resolved_cwd,
-            capture_output=True,
-            text=True,
-            timeout=settings.shell_command_timeout_seconds,
-            check=False,
-        )
-        stdout, stdout_truncated = _truncate_output(completed.stdout or "")
-        stderr, stderr_truncated = _truncate_output(completed.stderr or "")
-        return ShellExecutionResult(
-            allowed=True,
-            command=_normalize_command(command),
-            cwd=resolved_cwd,
-            exit_code=int(completed.returncode),
-            stdout=stdout,
-            stderr=stderr,
-            duration_seconds=round(max(0.0, time.time() - started_at), 3),
-            risk_level=policy.risk_level,
-            policy_reason=policy.reason,
-            truncated=stdout_truncated or stderr_truncated,
-            workspace_root=policy.workspace_root,
-            write_detected=policy.write_detected,
-            touched_paths=policy.touched_paths,
-            policy_violations=policy.violations,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout, stdout_truncated = _truncate_output(exc.stdout or "")
-        stderr, stderr_truncated = _truncate_output(exc.stderr or "")
+    provider = resolve_shell_provider(
+        provider_name=settings.shell_provider,
+        shell_program=settings.shell_program,
+    )
+    process_result = run_process(
+        provider.spawn_args(command),
+        cwd=resolved_cwd,
+        timeout_seconds=settings.shell_command_timeout_seconds,
+    )
+    stdout, stdout_truncated = _truncate_output(process_result.stdout)
+    stderr, stderr_truncated = _truncate_output(process_result.stderr)
+    if process_result.timed_out:
         return ShellExecutionResult(
             allowed=True,
             command=_normalize_command(command),
@@ -550,7 +557,7 @@ def run_shell_command(
             exit_code=-2,
             stdout=stdout,
             stderr=stderr,
-            duration_seconds=round(max(0.0, time.time() - started_at), 3),
+            duration_seconds=process_result.duration_seconds,
             risk_level=policy.risk_level,
             policy_reason=f"command timed out after {settings.shell_command_timeout_seconds}s.",
             truncated=stdout_truncated or stderr_truncated,
@@ -559,6 +566,22 @@ def run_shell_command(
             touched_paths=policy.touched_paths,
             policy_violations=policy.violations,
         )
+    return ShellExecutionResult(
+        allowed=True,
+        command=_normalize_command(command),
+        cwd=resolved_cwd,
+        exit_code=process_result.exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=process_result.duration_seconds,
+        risk_level=policy.risk_level,
+        policy_reason=policy.reason,
+        truncated=stdout_truncated or stderr_truncated,
+        workspace_root=policy.workspace_root,
+        write_detected=policy.write_detected,
+        touched_paths=policy.touched_paths,
+        policy_violations=policy.violations,
+    )
 
 
 async def arun_shell_command(command: str, *, cwd: str | None = None) -> ShellExecutionResult:
@@ -593,54 +616,47 @@ async def arun_shell_command(command: str, *, cwd: str | None = None) -> ShellEx
             approval_expires_at_ts=approval_request.expires_at_ts if approval_request else 0.0,
         )
 
-    started_at = time.time()
-    try:
-        process = await asyncio.create_subprocess_exec(
-            settings.shell_program,
-            "-lc",
-            command,
-            cwd=resolved_cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            process.communicate(),
-            timeout=settings.shell_command_timeout_seconds,
-        )
-        stdout, stdout_truncated = _truncate_output(stdout_bytes.decode("utf-8", errors="replace"))
-        stderr, stderr_truncated = _truncate_output(stderr_bytes.decode("utf-8", errors="replace"))
+    provider = resolve_shell_provider(
+        provider_name=settings.shell_provider,
+        shell_program=settings.shell_program,
+    )
+    process_result = await arun_process(
+        provider.spawn_args(command),
+        cwd=resolved_cwd,
+        timeout_seconds=settings.shell_command_timeout_seconds,
+    )
+    stdout, stdout_truncated = _truncate_output(process_result.stdout)
+    stderr, stderr_truncated = _truncate_output(process_result.stderr)
+    if process_result.timed_out:
         return ShellExecutionResult(
             allowed=True,
             command=_normalize_command(command),
             cwd=resolved_cwd,
-            exit_code=int(process.returncode or 0),
+            exit_code=-2,
             stdout=stdout,
             stderr=stderr,
-            duration_seconds=round(max(0.0, time.time() - started_at), 3),
+            duration_seconds=process_result.duration_seconds,
             risk_level=policy.risk_level,
-            policy_reason=policy.reason,
+            policy_reason=f"command timed out after {settings.shell_command_timeout_seconds}s.",
             truncated=stdout_truncated or stderr_truncated,
             workspace_root=policy.workspace_root,
             write_detected=policy.write_detected,
             touched_paths=policy.touched_paths,
             policy_violations=policy.violations,
         )
-    except TimeoutError:
-        process.kill()
-        await process.wait()
-        return ShellExecutionResult(
-            allowed=True,
-            command=_normalize_command(command),
-            cwd=resolved_cwd,
-            exit_code=-2,
-            stdout="",
-            stderr="",
-            duration_seconds=round(max(0.0, time.time() - started_at), 3),
-            risk_level=policy.risk_level,
-            policy_reason=f"command timed out after {settings.shell_command_timeout_seconds}s.",
-            truncated=False,
-            workspace_root=policy.workspace_root,
-            write_detected=policy.write_detected,
-            touched_paths=policy.touched_paths,
-            policy_violations=policy.violations,
-        )
+    return ShellExecutionResult(
+        allowed=True,
+        command=_normalize_command(command),
+        cwd=resolved_cwd,
+        exit_code=process_result.exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=process_result.duration_seconds,
+        risk_level=policy.risk_level,
+        policy_reason=policy.reason,
+        truncated=stdout_truncated or stderr_truncated,
+        workspace_root=policy.workspace_root,
+        write_detected=policy.write_detected,
+        touched_paths=policy.touched_paths,
+        policy_violations=policy.violations,
+    )

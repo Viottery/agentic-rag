@@ -11,7 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agent.llm import get_chat_model
 from app.agent.prompt_loader import load_prompt
 from app.agent.rag_router_utils import fallback_rag_route
-from app.agent.services.local_rag_shell_client import ainvoke_local_rag_via_bash, invoke_local_rag_via_bash
+from app.agent.services.local_rag_process_client import ainvoke_local_rag_via_subprocess, invoke_local_rag_via_subprocess
 from app.agent.schemas import CheckerDecision, FastPathDecision, PlannerDecision, QueryRewritePlan, RAGRoutePlan, SearchResultSelection, ToolExecutionPlan
 from app.agent.skill_runtime import task_type_to_executor
 from app.agent.state import AgentState, AgentStep, CitationItem, EvidenceItem, ExecutionResult, SkillResult, SubTask, SubtaskState
@@ -2521,8 +2521,8 @@ def _apply_local_rag_program_response(
 def local_kb_retrieve_service(state: AgentState) -> AgentState:
     payload = _local_rag_program_payload(state)
     try:
-        response = invoke_local_rag_via_bash(payload)
-        observation = "local rag program executed via bash."
+        response = invoke_local_rag_via_subprocess(payload)
+        observation = "local rag program executed via subprocess."
         return _apply_local_rag_program_response(
             state,
             response,
@@ -2560,8 +2560,8 @@ def local_kb_retrieve_service(state: AgentState) -> AgentState:
 async def local_kb_retrieve_service_async(state: AgentState) -> AgentState:
     payload = _local_rag_program_payload(state)
     try:
-        response = await ainvoke_local_rag_via_bash(payload)
-        observation = "local rag program executed via bash."
+        response = await ainvoke_local_rag_via_subprocess(payload)
+        observation = "local rag program executed via subprocess."
         return _apply_local_rag_program_response(
             state,
             response,
