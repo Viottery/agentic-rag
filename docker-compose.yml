@@ -2,7 +2,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: dockerfile
       args:
         PIP_INDEX_URL: https://mirrors.nju.edu.cn/pypi/web/simple
     container_name: agentic-rag-app

@@ -32,8 +32,6 @@ def route_after_planner(state: AgentState) -> str:
 
     if decision == "dispatch":
         return "task_dispatcher"
-    if decision == "finish":
-        return "end"
     return "answer_synthesizer"
 
 

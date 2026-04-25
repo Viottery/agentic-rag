@@ -13,6 +13,7 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
     fi && \
     apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ripgrep \
     build-essential \
     clinfo \
     libdrm-intel1 \

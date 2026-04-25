@@ -140,6 +140,16 @@ def test_fast_gate_routes_simple_question_to_direct_answer() -> None:
     assert updated["subtasks"] == []
 
 
+def test_fast_gate_routes_explicit_command_to_single_tool() -> None:
+    state = _base_state("请执行命令: printf ok，并返回命令输出。")
+
+    updated = nodes_module.fast_gate(state)
+
+    assert updated["fast_path_decision"]["mode"] == "single_skill"
+    assert updated["fast_path_decision"]["executor"] == "tool_execute"
+    assert updated["subtasks"][0]["executor"] == "tool_execute"
+
+
 def test_build_subtask_initial_state_creates_isolated_single_task_runtime() -> None:
     parent_state = _base_state("请根据知识库介绍一下这个项目的整体架构。")
     parent_state["evidence"] = [
@@ -341,10 +351,98 @@ def test_action_agent_executes_shell_runtime_when_plan_requests_shell(monkeypatc
     assert "AGENTIC RAG" in updated["current_task"]["result"]
 
 
+def test_explicit_command_uses_deterministic_shell_plan() -> None:
+    state = _base_state("请执行命令: printf ok")
+    state["current_task"] = {
+        "task_id": "a1",
+        "task_type": "action",
+        "executor": "tool_execute",
+        "question": "执行命令: printf ok",
+        "success_criteria": "返回命令输出",
+        "status": "running",
+        "result": "",
+        "evidence": [],
+        "sources": [],
+        "error": "",
+    }
+
+    plan = nodes_module._plan_tool_execution(state)
+
+    assert plan.mode == "shell"
+    assert plan.command == "printf ok"
+
+
+def test_explicit_command_plan_strips_return_output_suffix() -> None:
+    state = _base_state("请执行命令: printf ok，并返回命令输出。")
+    state["current_task"] = {
+        "task_id": "a1",
+        "task_type": "action",
+        "executor": "tool_execute",
+        "question": "执行命令: printf ok，并返回命令输出。",
+        "success_criteria": "返回命令输出",
+        "status": "running",
+        "result": "",
+        "evidence": [],
+        "sources": [],
+        "error": "",
+    }
+
+    plan = nodes_module._plan_tool_execution(state)
+
+    assert plan.mode == "shell"
+    assert plan.command == "printf ok"
+
+
+def test_terminal_tool_result_is_rendered_and_checker_finishes() -> None:
+    state = _base_state("执行命令: printf ok")
+    state["subtasks"] = [
+        {
+            "task_id": "execute_shell_command",
+            "task_type": "action",
+            "executor": "tool_execute",
+            "question": "执行命令: printf ok",
+            "success_criteria": "返回命令输出",
+            "status": "done",
+            "result": "shell command: printf ok\nexit_code: 0\nstdout:\nok\n\nstderr:\n(empty)",
+            "evidence": [],
+            "sources": ["shell_runtime"],
+            "error": "",
+            "degraded": False,
+            "degraded_reason": "",
+        }
+    ]
+    state["used_tools"] = ["shell_runtime"]
+    state["evidence"] = [
+        {
+            "source_type": "tool",
+            "source_name": "shell_runtime",
+            "source_id": "execute_shell_command_shell",
+            "title": "Shell Runtime Result",
+            "content": "shell command: printf ok\nexit_code: 0\nstdout:\nok\n\nstderr:\n(empty)",
+            "score": 1.0,
+            "metadata": {
+                "command": "printf ok",
+                "exit_code": 0,
+                "policy_reason": "allowed",
+                "degraded": False,
+            },
+        }
+    ]
+
+    answered = nodes_module.answer_generator(state)
+    checked = nodes_module.checker(answered)
+
+    assert "printf ok" in answered["answer_draft"]
+    assert checked["status"] == "finished"
+    assert checked["checker_result"]["pass_reason"] == "terminal_tool_pass"
+    assert "stdout" in checked["answer"]
+
+
 def test_graph_routes_use_main_and_subtask_boundaries() -> None:
     assert graph_module.route_after_fast_gate({"fast_path_decision": {"mode": "direct_answer"}}) == "fast_answer"
     assert graph_module.route_after_fast_gate({"fast_path_decision": {"mode": "single_skill"}}) == "task_dispatcher"
     assert graph_module.route_after_planner({"planner_control": {"decision": "dispatch"}}) == "task_dispatcher"
+    assert graph_module.route_after_planner({"planner_control": {"decision": "finish"}}) == "answer_synthesizer"
     assert graph_module.route_after_task_dispatcher({"current_task": {"task_id": "t1"}}) == "execution_agent"
     assert graph_module.route_after_execution_agent({"fast_path_decision": {"mode": "single_skill"}}) == "answer_synthesizer"
     assert graph_module.route_after_validator({"checker_result": {"passed": False}}) == "planner"

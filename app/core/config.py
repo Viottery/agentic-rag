@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     shell_runtime_enabled: bool = True
     shell_program: str = "bash"
     shell_policy_mode: str = "workspace-write"
+    shell_workspace_root: str = "/workspace"
+    shell_allowed_extra_roots: str = ""
+    shell_protected_paths: str = ".git,.env,data/memory/conversations.db"
+    shell_allow_destructive_commands: bool = False
+    shell_approval_mode: str = "high-risk"
+    shell_approval_ttl_seconds: int = 900
     shell_command_timeout_seconds: int = 60
     shell_max_output_chars: int = 6000
     tavily_api_key: str = ""

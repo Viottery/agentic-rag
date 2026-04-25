@@ -595,6 +595,15 @@ def _build_fast_path_decision(question: str) -> FastPathDecision:
     cleaned = question.strip()
     lowered = cleaned.lower()
 
+    if re.search(r"`[^`]+`", cleaned) or re.search(r"(?:执行命令|运行命令|command)\s*[:：]", cleaned, flags=re.IGNORECASE):
+        return FastPathDecision(
+            mode="single_skill",
+            reason="question includes an explicit shell command.",
+            executor="tool_execute",
+            question=cleaned,
+            success_criteria="执行用户明确给出的命令，并返回结构化命令结果。",
+        )
+
     if _looks_like_multi_step_problem(cleaned):
         return FastPathDecision(
             mode="planner_loop",
@@ -984,9 +993,21 @@ def _fallback_tool_execution_plan(action_input: str) -> ToolExecutionPlan:
 
     command_match = re.search(r"(?:执行命令|运行命令|command)\s*[:：]\s*(.+)", action_input, flags=re.IGNORECASE)
     if command_match:
+        command = command_match.group(1).strip()
+        for suffix in (
+            "并返回命令输出。",
+            "并返回命令输出",
+            "并返回输出。",
+            "并返回输出",
+            "and return the output.",
+            "and return the output",
+        ):
+            if command.endswith(suffix):
+                command = command[: -len(suffix)].strip()
+        command = command.rstrip(" ，,;；")
         return ToolExecutionPlan(
             mode="shell",
-            command=command_match.group(1).strip(),
+            command=command,
             response_text="",
             rationale="User explicitly requested command execution.",
         )
@@ -1001,6 +1022,10 @@ def _fallback_tool_execution_plan(action_input: str) -> ToolExecutionPlan:
 
 def _plan_tool_execution(state: AgentState) -> ToolExecutionPlan:
     action_input = state.get("current_task", {}).get("question", "").strip()
+    deterministic_plan = _fallback_tool_execution_plan(action_input)
+    if deterministic_plan.mode == "shell":
+        return deterministic_plan
+
     prompt_template = load_prompt("tool_executor.md")
     conversation_context = _conversation_context_block(state)
 
@@ -1033,6 +1058,10 @@ def _plan_tool_execution(state: AgentState) -> ToolExecutionPlan:
 
 async def _aplan_tool_execution(state: AgentState) -> ToolExecutionPlan:
     action_input = state.get("current_task", {}).get("question", "").strip()
+    deterministic_plan = _fallback_tool_execution_plan(action_input)
+    if deterministic_plan.mode == "shell":
+        return deterministic_plan
+
     prompt_template = load_prompt("tool_executor.md")
     conversation_context = _conversation_context_block(state)
 
@@ -1072,6 +1101,67 @@ def _render_shell_execution_result(command: str, exit_code: int, stdout: str, st
         f"stdout:\n{stdout_text}\n\n"
         f"stderr:\n{stderr_text}"
     )
+
+
+def _is_terminal_tool_execution_state(state: AgentState) -> bool:
+    tasks = state.get("subtasks", [])
+    if not tasks:
+        return False
+    if any(task.get("status") not in {"done", "failed"} for task in tasks):
+        return False
+    tool_tasks = [
+        task
+        for task in tasks
+        if task.get("executor") == "tool_execute" or task.get("task_type") == "action"
+    ]
+    if not tool_tasks or len(tool_tasks) != len(tasks):
+        return False
+    return bool({"shell_runtime", "action_runtime"} & set(state.get("used_tools", [])))
+
+
+def _render_terminal_tool_answer(state: AgentState) -> str:
+    evidence_items = [
+        item
+        for item in state.get("evidence", [])
+        if item.get("source_name") in {"shell_runtime", "action_runtime"}
+    ]
+    if not evidence_items:
+        return state.get("aggregated_context", "").strip()
+
+    parts: list[str] = []
+    for index, evidence in enumerate(evidence_items, start=1):
+        metadata = evidence.get("metadata", {})
+        command = str(metadata.get("command", "")).strip()
+        exit_code = metadata.get("exit_code", "")
+        degraded = bool(metadata.get("degraded", False))
+        policy_reason = str(metadata.get("policy_reason", "")).strip()
+        status_text = "执行成功"
+        if degraded:
+            status_text = "执行未成功"
+        if policy_reason and policy_reason != "allowed":
+            status_text = "已被策略拦截"
+        if metadata.get("approval_required"):
+            status_text = "等待用户审批"
+
+        header = f"命令 {index} {status_text}"
+        if command:
+            header += f": `{command}`"
+        if exit_code != "":
+            header += f" (exit_code={exit_code})"
+        if policy_reason and policy_reason != "allowed":
+            header += f"\n策略原因：{policy_reason}"
+        if metadata.get("approval_required"):
+            approval_id = str(metadata.get("approval_id", "")).strip()
+            if approval_id:
+                header += (
+                    f"\n审批 ID：{approval_id}"
+                    f"\n审批接口：POST /shell/approvals/{approval_id}/approve"
+                )
+
+        content = _truncate_text(str(evidence.get("content", "")).strip(), 4000)
+        parts.append(f"{header}\n\n```text\n{content}\n```")
+
+    return "\n\n".join(parts).strip()
 
 
 def _split_paragraphs(text: str) -> list[str]:
@@ -3042,6 +3132,13 @@ def action_agent(state: AgentState) -> AgentState:
                 "risk_level": shell_result.risk_level,
                 "policy_reason": shell_result.policy_reason,
                 "truncated": shell_result.truncated,
+                "workspace_root": getattr(shell_result, "workspace_root", ""),
+                "write_detected": getattr(shell_result, "write_detected", False),
+                "touched_paths": getattr(shell_result, "touched_paths", None) or [],
+                "policy_violations": getattr(shell_result, "policy_violations", None) or [],
+                "approval_required": getattr(shell_result, "approval_required", False),
+                "approval_id": getattr(shell_result, "approval_id", ""),
+                "approval_expires_at_ts": getattr(shell_result, "approval_expires_at_ts", 0.0),
                 "degraded": degraded,
             },
         }
@@ -3141,6 +3238,13 @@ async def action_agent_async(state: AgentState) -> AgentState:
                 "risk_level": shell_result.risk_level,
                 "policy_reason": shell_result.policy_reason,
                 "truncated": shell_result.truncated,
+                "workspace_root": getattr(shell_result, "workspace_root", ""),
+                "write_detected": getattr(shell_result, "write_detected", False),
+                "touched_paths": getattr(shell_result, "touched_paths", None) or [],
+                "policy_violations": getattr(shell_result, "policy_violations", None) or [],
+                "approval_required": getattr(shell_result, "approval_required", False),
+                "approval_id": getattr(shell_result, "approval_id", ""),
+                "approval_expires_at_ts": getattr(shell_result, "approval_expires_at_ts", 0.0),
                 "degraded": degraded,
             },
         }
@@ -3182,6 +3286,35 @@ async def action_agent_async(state: AgentState) -> AgentState:
 def answer_generator(state: AgentState) -> AgentState:
     """汇总已有任务结果，生成答案草稿。"""
     question = state["question"].strip()
+    if _is_terminal_tool_execution_state(state):
+        answer_text = _render_terminal_tool_answer(state)
+        trace_summary = (
+            f"iterations={state['iteration_count']} | "
+            f"tasks={len(state['subtasks'])} | "
+            f"done={sum(1 for task in state['subtasks'] if task.get('status') == 'done')} | "
+            f"tools={','.join(state['used_tools']) if state['used_tools'] else 'None'} | "
+            f"elapsed={max(0.0, time.time() - state['started_at_ts']):.1f}s"
+        )
+        return {
+            **state,
+            "answer_draft": answer_text,
+            "grounded_answer": answer_text,
+            "citations": [],
+            "verification_result": {
+                "needs_revision": False,
+                "citation_coverage": 1.0,
+                "confidence": 1.0,
+                "supported_paragraphs": 0,
+                "total_paragraphs": 0,
+                "unsupported_claims": [],
+                "degraded_citations": [],
+                "summary": "terminal tool execution result; grounding validator bypassed.",
+            },
+            "trace_summary": trace_summary,
+            "observation": "tool 执行任务已生成确定性结果，跳过额外答案生成。",
+            "intermediate_steps": _append_step(state, "answer_generator", question, "terminal tool result rendered"),
+        }
+
     prompt_template = load_prompt("answer_generator.md")
     llm = get_chat_model()
 
@@ -3239,6 +3372,35 @@ def answer_generator(state: AgentState) -> AgentState:
 async def answer_generator_async(state: AgentState) -> AgentState:
     """汇总已有任务结果，生成答案草稿。"""
     question = state["question"].strip()
+    if _is_terminal_tool_execution_state(state):
+        answer_text = _render_terminal_tool_answer(state)
+        trace_summary = (
+            f"iterations={state['iteration_count']} | "
+            f"tasks={len(state['subtasks'])} | "
+            f"done={sum(1 for task in state['subtasks'] if task.get('status') == 'done')} | "
+            f"tools={','.join(state['used_tools']) if state['used_tools'] else 'None'} | "
+            f"elapsed={max(0.0, time.time() - state['started_at_ts']):.1f}s"
+        )
+        return {
+            **state,
+            "answer_draft": answer_text,
+            "grounded_answer": answer_text,
+            "citations": [],
+            "verification_result": {
+                "needs_revision": False,
+                "citation_coverage": 1.0,
+                "confidence": 1.0,
+                "supported_paragraphs": 0,
+                "total_paragraphs": 0,
+                "unsupported_claims": [],
+                "degraded_citations": [],
+                "summary": "terminal tool execution result; grounding validator bypassed.",
+            },
+            "trace_summary": trace_summary,
+            "observation": "tool 执行任务已生成确定性结果，跳过额外答案生成。",
+            "intermediate_steps": _append_step(state, "answer_generator", question, "terminal tool result rendered"),
+        }
+
     prompt_template = load_prompt("answer_generator.md")
     llm = get_chat_model()
 
@@ -3473,6 +3635,26 @@ def checker(state: AgentState) -> AgentState:
     force_reason = state["planner_control"].get("force_answer_reason", "").strip()
     final_answer_candidate = state["grounded_answer"].strip() or state["answer_draft"].strip()
 
+    if _is_terminal_tool_execution_state(state):
+        return {
+            **state,
+            "checker_result": {
+                "passed": True,
+                "feedback": "",
+                "pass_reason": "terminal_tool_pass",
+            },
+            "answer": final_answer_candidate or _render_terminal_tool_answer(state),
+            "status": "finished",
+            "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "observation": "tool 执行任务已终止，checker 直接放行结构化执行结果。",
+            "intermediate_steps": _append_step(
+                state,
+                "checker",
+                question,
+                "terminal tool execution passed",
+            ),
+        }
+
     if force_reason:
         return {
             **state,
@@ -3571,6 +3753,26 @@ async def checker_async(state: AgentState) -> AgentState:
     question = state["question"].strip()
     force_reason = state["planner_control"].get("force_answer_reason", "").strip()
     final_answer_candidate = state["grounded_answer"].strip() or state["answer_draft"].strip()
+
+    if _is_terminal_tool_execution_state(state):
+        return {
+            **state,
+            "checker_result": {
+                "passed": True,
+                "feedback": "",
+                "pass_reason": "terminal_tool_pass",
+            },
+            "answer": final_answer_candidate or _render_terminal_tool_answer(state),
+            "status": "finished",
+            "finished_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "observation": "tool 执行任务已终止，checker 直接放行结构化执行结果。",
+            "intermediate_steps": _append_step(
+                state,
+                "checker",
+                question,
+                "terminal tool execution passed",
+            ),
+        }
 
     if force_reason:
         return {

@@ -22,8 +22,10 @@ Return only the structured fields required by the schema:
 # Policy
 
 - Prefer `shell` when the task is an explicit execution, file inspection, code/test command, calculation, or text transformation that can be completed reliably through one shell command.
+- For an explicit user-provided command, prefer `shell` and let the runtime policy enforce workspace, protected-path, and destructive-command restrictions.
+- Non-destructive reads and writes inside the configured workspace are allowed when the user explicitly asks for them.
 - Prefer `respond` only when the task is trivial enough to answer directly and shell adds no value.
-- Use `reject` when the task would require risky, destructive, privileged, or clearly underspecified shell execution.
+- Use `reject` when the task would require risky, destructive, privileged, workspace-external, or clearly underspecified shell execution.
 - Never use `sudo`.
 - Never generate destructive commands such as deleting system files, formatting disks, rebooting, or remote-access commands.
 - Prefer deterministic commands.
