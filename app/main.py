@@ -7,18 +7,23 @@ from app.agent.services.local_rag_socket_service import get_local_rag_socket_ser
 from app.api.routes.chat import router as chat_router
 from app.api.routes.health import router as health_router
 from app.api.routes.shell import router as shell_router
+from app.core.config import get_settings
 from app.runtime.conversation_store import get_conversation_store
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await asyncio.to_thread(get_conversation_store().initialize)
-    rag_service = get_local_rag_socket_service()
-    await rag_service.start()
+    settings = get_settings()
+    rag_service = None
+    if settings.local_rag_enabled:
+        rag_service = get_local_rag_socket_service()
+        await rag_service.start()
     try:
         yield
     finally:
-        await rag_service.stop()
+        if rag_service is not None:
+            await rag_service.stop()
 
 
 app = FastAPI(title="Agentic RAG", debug=True, lifespan=lifespan)

@@ -196,6 +196,35 @@ def test_subtask_bootstrap_routes_local_kb_executor_to_program_service() -> None
     assert subtask_graph_module.route_after_bootstrap(subtask_state) == "local_kb_retrieve_service"
 
 
+def test_local_kb_service_returns_controlled_degraded_result_when_disabled(monkeypatch) -> None:
+    state = _base_state("请根据知识库介绍一下这个项目。")
+    state["current_task"] = {
+        "task_id": "t-rag",
+        "task_type": "rag",
+        "executor": "local_kb_retrieve",
+        "question": "项目介绍",
+        "success_criteria": "返回证据",
+        "status": "running",
+        "result": "",
+        "evidence": [],
+        "sources": [],
+        "error": "",
+    }
+    state["subtasks"] = [state["current_task"]]
+    monkeypatch.setattr(
+        nodes_module,
+        "get_settings",
+        lambda: types.SimpleNamespace(local_rag_enabled=False),
+    )
+
+    updated = nodes_module.local_kb_retrieve_service(state)
+
+    assert updated["current_task"]["status"] == "failed"
+    assert updated["current_task"]["degraded"] is True
+    assert "disabled" in updated["current_task"]["degraded_reason"]
+    assert updated["used_tools"] == ["local_rag_disabled"]
+
+
 def test_execution_agent_records_structured_execution_result(monkeypatch) -> None:
     state = _base_state("请根据知识库介绍一下这个项目的整体架构。")
     state["fast_path_decision"]["mode"] = "single_skill"

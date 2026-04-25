@@ -7,8 +7,10 @@ class Settings(BaseSettings):
     app_name: str = "Agentic RAG"
     app_env: str = "dev"
     debug: bool = True
+    qdrant_mode: str = "server"
     qdrant_host: str = "qdrant"
     qdrant_port: int = 6333
+    qdrant_local_path: str = "data/qdrant-local"
     embedding_model: str = "BAAI/bge-base-zh-v1.5"
     embedding_backend: str = "torch"
     embedding_device: str = "cpu"
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
     local_rag_socket_path: str = ""
     local_rag_host: str = "127.0.0.1"
     local_rag_port: int = 8765
+    local_rag_enabled: bool = True
     local_rag_retrieve_workers: int = 2
     local_rag_embedding_batch_size: int = 8
     local_rag_rerank_batch_tasks: int = 4

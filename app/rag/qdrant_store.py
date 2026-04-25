@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import defaultdict
+from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 from typing import TYPE_CHECKING, Any
 
@@ -9,6 +10,7 @@ if TYPE_CHECKING:
     from qdrant_client import QdrantClient
     from qdrant_client.models import Distance, FieldCondition, Filter, MatchValue, PointStruct, VectorParams
 
+from app.core.config import get_settings
 from app.rag.schemas import DocumentChunk, RetrievedItem
 
 
@@ -201,10 +203,15 @@ class QdrantStore:
         collection_name: str = DEFAULT_COLLECTION_NAME,
         host: str | None = None,
         port: int | None = None,
+        mode: str | None = None,
+        local_path: str | None = None,
     ) -> None:
+        settings = get_settings()
         self.collection_name = collection_name
-        self.host = host or os.getenv("QDRANT_HOST", "localhost")
-        self.port = port or int(os.getenv("QDRANT_PORT", "6333"))
+        self.mode = (mode or os.getenv("QDRANT_MODE", settings.qdrant_mode)).strip().lower() or "server"
+        self.host = host or os.getenv("QDRANT_HOST", settings.qdrant_host)
+        self.port = port or int(os.getenv("QDRANT_PORT", str(settings.qdrant_port)))
+        self.local_path = local_path or os.getenv("QDRANT_LOCAL_PATH", settings.qdrant_local_path)
 
         try:
             from qdrant_client import QdrantClient
@@ -214,7 +221,13 @@ class QdrantStore:
                 "请先安装 requirements.txt 中的依赖。"
             ) from exc
 
-        self.client = QdrantClient(host=self.host, port=self.port)
+        if self.mode in {"local", "embedded", "path"}:
+            resolved_local_path = Path(self.local_path).expanduser().resolve()
+            resolved_local_path.mkdir(parents=True, exist_ok=True)
+            self.local_path = str(resolved_local_path)
+            self.client = QdrantClient(path=self.local_path)
+        else:
+            self.client = QdrantClient(host=self.host, port=self.port)
 
     def collection_exists(self) -> bool:
         """

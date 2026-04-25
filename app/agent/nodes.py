@@ -367,6 +367,9 @@ def _format_evidence_for_prompt(evidence_items: list[EvidenceItem], limit: int =
 
 
 def _load_kb_structure_summary(state: AgentState) -> str:
+    if not get_settings().local_rag_enabled:
+        return "Local KB retrieval is disabled by configuration."
+
     cached = state.get("kb_structure_summary", "").strip()
     if cached:
         return cached
@@ -2518,7 +2521,43 @@ def _apply_local_rag_program_response(
     }
 
 
+def _local_rag_disabled_state(state: AgentState) -> AgentState:
+    reason = "Local KB retrieval is disabled by configuration."
+    task = state.get("current_task", {})
+    disabled_task: SubTask = {
+        **task,
+        "status": "failed",
+        "result": reason,
+        "evidence": [],
+        "sources": [],
+        "error": reason,
+        "degraded": True,
+        "degraded_reason": reason,
+    }
+    subtasks = _replace_task(state, disabled_task)
+    return {
+        **state,
+        "subtasks": subtasks,
+        "current_task": disabled_task,
+        "retrieved_docs": [],
+        "retrieved_sources": [],
+        "aggregated_context": _build_aggregated_context(subtasks),
+        "used_tools": [*state.get("used_tools", []), "local_rag_disabled"],
+        "observation": reason,
+        "error": reason,
+        "intermediate_steps": _append_step(
+            state,
+            "local_kb_retrieve_service",
+            str(task.get("question", state.get("question", ""))),
+            reason,
+        ),
+    }
+
+
 def local_kb_retrieve_service(state: AgentState) -> AgentState:
+    if not get_settings().local_rag_enabled:
+        return _local_rag_disabled_state(state)
+
     payload = _local_rag_program_payload(state)
     try:
         response = invoke_local_rag_via_subprocess(payload)
@@ -2558,6 +2597,9 @@ def local_kb_retrieve_service(state: AgentState) -> AgentState:
 
 
 async def local_kb_retrieve_service_async(state: AgentState) -> AgentState:
+    if not get_settings().local_rag_enabled:
+        return _local_rag_disabled_state(state)
+
     payload = _local_rag_program_payload(state)
     try:
         response = await ainvoke_local_rag_via_subprocess(payload)

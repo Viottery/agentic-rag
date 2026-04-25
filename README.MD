@@ -99,6 +99,8 @@ More detailed flow notes live in [docs/langgraph-workflow-visualization.md](/hom
 - [docs/future-roadmap.md](/home/viottery/workspace/agentic-rag/docs/future-roadmap.md): staged migration plan for fast gate, execution-agent runtime, skill registry, service-ization, cross-platform CLI invocation, and shell risk control
 - [docs/capability-protocol-and-skills.md](/home/viottery/workspace/agentic-rag/docs/capability-protocol-and-skills.md): unified tool invocation protocol, MCP as a capability source, and skill semantics as prompt/workflow descriptors rather than executors
 - [docs/agent-product-gap-analysis.md](/home/viottery/workspace/agentic-rag/docs/agent-product-gap-analysis.md): product-level reasons for moving from node-heavy orchestration to shell-first execution agents plus service-backed capabilities
+- [docs/windows-deployment.md](/home/viottery/workspace/agentic-rag/docs/windows-deployment.md): Windows Docker Desktop bootstrap script, daily commands, optional indexing, and troubleshooting
+- [docs/windows-native-agent.md](/home/viottery/workspace/agentic-rag/docs/windows-native-agent.md): pure Windows bootstrap without Docker/WSL, with local RAG/Qdrant disabled so agent and shell paths can run first
 
 ## Runtime Strategy
 
@@ -320,6 +322,10 @@ Current observed behavior on this machine:
 - when that happens, the code falls back automatically instead of breaking the RAG pipeline
 
 ## Run Locally
+
+For Windows Docker Desktop deployment and usage, see [docs/windows-deployment.md](/home/viottery/workspace/agentic-rag/docs/windows-deployment.md).
+
+For pure Windows without Docker/WSL, start with [docs/windows-native-agent.md](/home/viottery/workspace/agentic-rag/docs/windows-native-agent.md). That mode disables local RAG/Qdrant first and brings up chat, agent, shell/action, and web-search paths.
 
 Start services:
 
